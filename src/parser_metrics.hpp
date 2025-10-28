@@ -140,17 +140,21 @@ std::unordered_map<std::string, kernel_metrics> create_metrics(const std::string
         std::vector<std::string> row;
         std::string line, word;
 
-        // This will skip the first three lines (including the header)
+        // Skip the first non-CSV lines (including logs)
         // https://stackoverflow.com/questions/33250380/c-skip-first-line-of-csv-file
-        while (line.length() == 0 || line[0] != '"') {
-            std::getline(file, line);
+        while (std::getline(file, line)) {
+            if (!line.empty() && line[0] == '"') break;
         }
 
         // Find correct column of metric name and value
         std::stringstream header(line);
         int word_index = 0;
-        while (std::getline(header, word, '"'))
+        while (std::getline(header, word, ','))  // Split by comma
         {
+            // Remove surrounding quotes
+            if (!word.empty() && word.front() == '"') word.erase(0, 1);
+            if (!word.empty() && word.back() == '"') word.pop_back();
+
             if (word == "Metric Name") {
                 metric_name_index = word_index;
             } else if (word == "Metric Value") {
@@ -163,11 +167,12 @@ std::unordered_map<std::string, kernel_metrics> create_metrics(const std::string
         while (std::getline(file, line))
         {
             row.clear();
-
             std::stringstream str(line);
-
-            while (std::getline(str, word, '"'))
+            while (std::getline(str, word, ','))
             {
+                if (!word.empty() && word.front() == '"') word.erase(0, 1);
+                if (!word.empty() && word.back() == '"') word.pop_back();
+
                 row.push_back(word);
             }
             data.push_back(row);
