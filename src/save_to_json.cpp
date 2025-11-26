@@ -14,7 +14,11 @@ using json = nlohmann::json;
 
 // https://www.jeremymorgan.com/tutorials/c-programming/how-to-capture-the-output-of-a-linux-command-in-c/
 std::string get_demangled_kernel(std::string kernel_name) {
-    std::string command = "cu++filt " + kernel_name;
+    std::string safe = kernel_name;
+    if (!safe.empty() && safe.back() == '(')
+        safe.pop_back();
+    std::string command = "cu++filt '" + safe + "'";
+    // std::string command = "cu++filt " + kernel_name;
     std::string result;
     FILE* stream;
     const int max_buffer = 256;
