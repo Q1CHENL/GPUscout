@@ -58,8 +58,7 @@ int main(int argc, char **argv)
             {"sass_registers", ""},
             {"ptx", ""},
         }},
-        {"source_files", json::object()},
-        {"kernels", json::object()}
+        {"source_files", json::object()}
     };
 
     // Add individual analysis results to result file
@@ -73,12 +72,15 @@ int main(int argc, char **argv)
         if (filename.find(".json") == std::string::npos)
             continue;
 
-        filename = filename.substr(0, filename.length() - 5);
+        // Skip previously combined result files to avoid treating top-level keys as kernels
+        std::string base_no_ext = filename.substr(0, filename.length() - 5);
+        if (base_no_ext.rfind("result-", 0) == 0) continue;
+
         std::ifstream analysis_file(path);
         if (analysis_file.is_open()) {
-            result["analyses"][filename] = json::parse(analysis_file);
+            result["analyses"][base_no_ext] = json::parse(analysis_file);
 
-            for (auto& kernel : result["analyses"][filename].items()) {
+            for (auto& kernel : result["analyses"][base_no_ext].items()) {
                 if (!result["kernels"].contains(kernel.key())) {
                     result["kernels"][kernel.key()] = get_demangled_kernel(kernel.key());
                 }
