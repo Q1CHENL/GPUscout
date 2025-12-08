@@ -84,20 +84,24 @@
 
 using namespace CUPTI::PcSamplingUtil;
 
-#define CUPTI_CALL(call)                                                    \
-{                                                                           \
- CUptiResult _status = call;                                                \
- if (_status != CUPTI_SUCCESS)                                              \
-    {                                                                       \
-     const char* errstr;                                                    \
-     cuptiGetResultString(_status, &errstr);                                \
-     fprintf(stderr, "%s:%d: error: function %s failed with error %s.\n",   \
-             __FILE__,                                                      \
-             __LINE__,                                                      \
-             #call,                                                         \
-             errstr);                                                       \
-     exit(EXIT_FAILURE);                                                    \
-    }                                                                       \
+#define CUPTI_CALL(call)                                                            \
+{                                                                                   \
+    CUptiResult _status = call;                                                     \
+    if (_status != CUPTI_SUCCESS) {                                                 \
+        const char* errstr = nullptr;                                               \
+        cuptiGetResultString(_status, &errstr);                                     \
+        if (_status == CUPTI_ERROR_INSUFFICIENT_PRIVILEGES) {                       \
+            fprintf(stderr,                                                         \
+                    "%s:%d: error: function %s failed with error %s.\n"             \
+                    "This might be a permission issue with Performance Counters.\n" \
+                    "For more infomation and troubleshooting: https://developer.nvidia.com/nvidia-development-tools-solutions-err_nvgpuctrperm-permission-issue-performance-counters\n" \
+                    __FILE__, __LINE__, #call, errstr);                             \
+        } else {                                                                    \
+            fprintf(stderr, "%s:%d: error: function %s failed with error %s.\n",    \
+                    __FILE__, __LINE__, #call, errstr);                             \
+        }                                                                           \
+        exit(EXIT_FAILURE);                                                         \
+    }                                                                               \
 }
 
 #define MEMORY_ALLOCATION_CALL(var)                                             \
