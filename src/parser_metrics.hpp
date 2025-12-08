@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <memory>
 #include <cmath>
+#include <locale>
 #include "utilities/json.hpp"
 
 using json = nlohmann::json;
@@ -124,6 +125,75 @@ void coalescing_efficiency(const kernel_metrics &);
 void shared_memory_bank_conflict(const kernel_metrics &);
 // void stalls_static_analysis_relation(const kernel_metrics&);
 
+static inline std::string trim_copy(const std::string &s)
+{
+    size_t start = 0;
+    while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) start++;
+    size_t end = s.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) end--;
+    return s.substr(start, end - start);
+}
+
+static inline std::vector<std::string> parse_csv_line(const std::string &line)
+{
+    std::vector<std::string> fields;
+    std::string current;
+    bool in_quotes = false;
+    for (size_t i = 0; i < line.size(); ++i)
+    {
+        char c = line[i];
+        if (c == '"')
+        {
+            if (in_quotes && i + 1 < line.size() && line[i + 1] == '"')
+            {
+                // Escaped quote inside a quoted field
+                current.push_back('"');
+                ++i;
+            }
+            else
+            {
+                in_quotes = !in_quotes;
+            }
+        }
+        else if (c == ',' && !in_quotes)
+        {
+            fields.push_back(trim_copy(current));
+            current.clear();
+        }
+        else
+        {
+            current.push_back(c);
+        }
+    }
+    fields.push_back(trim_copy(current));
+    return fields;
+}
+
+static inline double parse_metric_value(const std::string &value_str)
+{
+    std::string cleaned;
+    cleaned.reserve(value_str.size());
+    for (char c : value_str)
+    {
+        // Keep digits, sign, decimal point and exponent markers; drop thousands separators
+        if (std::isdigit(static_cast<unsigned char>(c)) || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')
+        {
+            cleaned.push_back(c);
+        }
+    }
+    if (cleaned.empty()) return 0.0;
+    // Use classic C locale to ensure '.' decimal handling
+    std::locale::global(std::locale::classic());
+    try
+    {
+        return std::stod(cleaned);
+    }
+    catch (...)
+    {
+        return 0.0;
+    }
+}
+
 /// @brief Parse the cuda metrics file to store the values in variables
 /// @param filename cuda metrics file
 /// @return stored metric values for each kernel
@@ -131,338 +201,357 @@ std::unordered_map<std::string, kernel_metrics> create_metrics(const std::string
 {
     std::vector<std::vector<std::string>> data;
 
-    int metric_name_index = 19;
-    int metric_value_index = 23;
+    int idx_id = -1;
+    int idx_kernel_name = -1;
+    int idx_section_name = -1;
+    int idx_metric_name = -1;
+    int idx_metric_value = -1;
 
     std::fstream file(filename, std::ios::in);
     if (file.is_open())
     {
-        std::vector<std::string> row;
-        std::string line, word;
+        std::string line;
 
-        // Skip the first non-CSV lines (including logs)
-        // https://stackoverflow.com/questions/33250380/c-skip-first-line-of-csv-file
-        while (std::getline(file, line)) {
-            if (!line.empty() && line[0] == '"') break;
-        }
-
-        // Find correct column of metric name and value
-        std::stringstream header(line);
-        int word_index = 0;
-        while (std::getline(header, word, ','))  // Split by comma
-        {
-            // Remove surrounding quotes
-            if (!word.empty() && word.front() == '"') word.erase(0, 1);
-            if (!word.empty() && word.back() == '"') word.pop_back();
-
-            if (word == "Metric Name") {
-                metric_name_index = word_index;
-            } else if (word == "Metric Value") {
-                metric_value_index = word_index;
-            }
-            word_index++;
-        }
-
-        // Read from the next lines (contains the data)
+        // Skip non-CSV preamble; stop at first line that looks like CSV (starts with a quote)
         while (std::getline(file, line))
         {
-            row.clear();
-            std::stringstream str(line);
-            while (std::getline(str, word, ','))
-            {
-                if (!word.empty() && word.front() == '"') word.erase(0, 1);
-                if (!word.empty() && word.back() == '"') word.pop_back();
+            if (!line.empty() && line.front() == '"') break;
+        }
 
-                row.push_back(word);
-            }
-            data.push_back(row);
+        if (!file.good() && (line.empty() || line.front() != '"'))
+        {
+            std::cout << "Could not find CSV header in file: " << filename << std::endl;
+            return {};
+        }
+
+        // Parse header with quote-aware CSV
+        auto header_fields = parse_csv_line(line);
+        for (size_t i = 0; i < header_fields.size(); ++i)
+        {
+            const std::string &h = header_fields[i];
+            if (h == "ID") idx_id = static_cast<int>(i);
+            else if (h == "Kernel Name") idx_kernel_name = static_cast<int>(i);
+            else if (h == "Section Name") idx_section_name = static_cast<int>(i);
+            else if (h == "Metric Name") idx_metric_name = static_cast<int>(i);
+            else if (h == "Metric Value") idx_metric_value = static_cast<int>(i);
+        }
+
+        // Read remaining lines
+        while (std::getline(file, line))
+        {
+            if (line.empty()) continue;
+            data.push_back(parse_csv_line(line));
         }
     }
     else
+    {
         std::cout << "Could not open the file: " << filename << std::endl;
+        return {};
+    }
 
     // Parsing the metrics file to store the values in the variables
     // Log file content header looks like:
     // "ID","Process ID","Process Name","Host Name","Kernel Name","Kernel Time","Context","Stream","Section Name","Metric Name","Metric Unit","Metric Value"
 
-    cuda_metrics metric_obj;
-    std::unordered_map<std::string, kernel_metrics> metric_map; // create a map with the kernel id as the key and the metrics metadata as the value
+    std::unordered_map<std::string, kernel_metrics> metric_map;
 
-    // Note: Clean the metrics_list file: remove from begining till the headers (including)
-
-    for (auto i : data)
+    if (idx_kernel_name < 0 || idx_metric_name < 0 || idx_metric_value < 0)
     {
-        if (i.size() < metric_name_index || i.size() < metric_value_index) continue;
-        // Clean the " character from the metric name and metric value and remove the dot (uses German format here)
-        i[metric_name_index].erase(std::remove(i[metric_name_index].begin(), i[metric_name_index].end(), '"'), i[metric_name_index].end()); // metric name
-        i[metric_value_index].erase(std::remove(i[metric_value_index].begin(), i[metric_value_index].end(), '"'), i[metric_value_index].end()); // metric value
-        i[metric_value_index].erase(std::remove(i[metric_value_index].begin(), i[metric_value_index].end(), '.'), i[metric_value_index].end()); // remove the dot (since in numeral German, dot = comma in English)
-        std::replace(i[metric_value_index].begin(), i[metric_value_index].end(), ',', '.');                     // replace comma with dot
-        // std::cout << i[9] << std::endl;
+        std::cout << "CSV header missing required columns in: " << filename << std::endl;
+        return {};
+    }
 
-        // Note: loosing the decimal part of the value since in German it is denoted as comma and we are using comma as delimiter
-        if (i[metric_name_index] == "smsp__sass_inst_executed.sum")
-        {
-            metric_obj.smsp__sass_inst_executed = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum")
-        {
-            metric_obj.l1tex__t_sectors_pipe_lsu_mem_global_op_st = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__sass_inst_executed_op_global.sum")
-        {
-            metric_obj.smsp__sass_inst_executed_op_global = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__warps_active.sum")
-        {
-            metric_obj.smsp__warps_active = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__warp_issue_stalled_barrier_per_warp_active.pct")
-        {
-            metric_obj.smsp__warp_issue_stalled_barrier_per_warp_active = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__warp_issue_stalled_membar_per_warp_active.pct")
-        {
-            metric_obj.smsp__warp_issue_stalled_membar_per_warp_active = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct")
-        {
-            metric_obj.smsp__warp_issue_stalled_short_scoreboard_per_warp_active = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__warp_issue_stalled_wait_per_warp_active.pct")
-        {
-            metric_obj.smsp__warp_issue_stalled_wait_per_warp_active = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__thread_inst_executed_per_inst_executed.ratio")
-        {
-            metric_obj.smsp__thread_inst_executed_per_inst_executed = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "sm__sass_branch_targets.avg")
-        {
-            metric_obj.sm__sass_branch_targets = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "sm__sass_branch_targets_threads_divergent.avg")
-        {
-            metric_obj.sm__sass_branch_targets_threads_divergent = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__warp_issue_stalled_imc_miss_per_warp_active.pct")
-        {
-            metric_obj.smsp__warp_issue_stalled_imc_miss_per_warp_active = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct")
-        {
-            metric_obj.smsp__warp_issue_stalled_long_scoreboard_per_warp_active = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "sm__warps_active.avg.pct_of_peak_sustained_active")
-        {
-            metric_obj.sm__warps_active = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__warp_issue_stalled_lg_throttle_per_warp_active.pct")
-        {
-            metric_obj.smsp__warp_issue_stalled_lg_throttle_per_warp_active = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct")
-        {
-            metric_obj.smsp__warp_issue_stalled_mio_throttle_per_warp_active = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__warp_issue_stalled_tex_throttle_per_warp_active.pct")
-        {
-            metric_obj.smsp__warp_issue_stalled_tex_throttle_per_warp_active = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "sm__sass_inst_executed_op_global_red.sum")
-        {
-            metric_obj.sm__sass_inst_executed_op_global_red = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "sm__sass_inst_executed_op_shared_atom.sum")
-        {
-            metric_obj.sm__sass_inst_executed_op_shared_atom = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum")
-        {
-            metric_obj.l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "sm__sass_inst_executed_op_shared_ld.sum")
-        {
-            metric_obj.sm__sass_inst_executed_op_shared_ld = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum")
-        {
-            metric_obj.l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "sm__sass_inst_executed_op_shared_st.sum")
-        {
-            metric_obj.sm__sass_inst_executed_op_shared_st = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__sass_average_data_bytes_per_wavefront_mem_shared.pct")
-        {
-            metric_obj.smsp__sass_average_data_bytes_per_wavefront_mem_shared = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__inst_executed_op_local_ld.sum")
-        {
-            metric_obj.smsp__inst_executed_op_local_ld = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__inst_executed_op_local_st.sum")
-        {
-            metric_obj.smsp__inst_executed_op_local_st = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "lts__t_sectors_op_atom.sum")
-        {
-            metric_obj.lts__t_sectors_op_atom = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "lts__t_sectors_op_read.sum")
-        {
-            metric_obj.lts__t_sectors_op_read = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "lts__t_sectors_op_red.sum")
-        {
-            metric_obj.lts__t_sectors_op_red = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "lts__t_sectors_op_write.sum")
-        {
-            metric_obj.lts__t_sectors_op_write = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sector_hit_rate.pct")
-        {
-            metric_obj.l1tex__t_sector_hit_rate = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "sm__sass_inst_executed_op_global_ld.sum")
-        {
-            metric_obj.sm__sass_inst_executed_op_global_ld = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "sm__sass_inst_executed_op_local_ld.sum")
-        {
-            metric_obj.sm__sass_inst_executed_op_local_ld = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum")
-        {
-            metric_obj.l1tex__t_sectors_pipe_lsu_mem_global_op_ld = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sector_pipe_lsu_mem_global_op_ld_hit_rate.pct")
-        {
-            metric_obj.l1tex__t_sector_pipe_lsu_mem_global_op_ld_hit_rate = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "lts__t_sector_op_read_hit_rate.pct")
-        {
-            metric_obj.lts__t_sector_op_read_hit_rate = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum")
-        {
-            metric_obj.l1tex__t_sectors_pipe_lsu_mem_local_op_ld = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sector_pipe_lsu_mem_local_op_ld_hit_rate.pct")
-        {
-            metric_obj.l1tex__t_sector_pipe_lsu_mem_local_op_ld_hit_rate = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sectors_pipe_lsu_mem_global_op_red.sum")
-        {
-            metric_obj.l1tex__t_sectors_pipe_lsu_mem_global_op_red = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sectors_pipe_lsu_mem_global_op_atom.sum")
-        {
-            metric_obj.l1tex__t_sectors_pipe_lsu_mem_global_op_atom = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sector_pipe_lsu_mem_global_op_red_hit_rate.pct")
-        {
-            metric_obj.l1tex__t_sector_pipe_lsu_mem_global_op_red_hit_rate = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sector_pipe_lsu_mem_global_op_atom_hit_rate.pct")
-        {
-            metric_obj.l1tex__t_sector_pipe_lsu_mem_global_op_atom_hit_rate = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "lts__t_sector_op_red_hit_rate.pct")
-        {
-            metric_obj.lts__t_sector_op_red_hit_rate = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "lts__t_sector_op_atom_hit_rate.pct")
-        {
-            metric_obj.lts__t_sector_op_atom_hit_rate = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "sm__sass_data_bytes_mem_shared_op_atom.sum")
-        {
-            metric_obj.sm__sass_data_bytes_mem_shared_op_atom = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__m_xbar2l1tex_read_sectors_mem_lg_op_ld.sum.pct_of_peak_sustained_elapsed")
-        {
-            metric_obj.l1tex__m_xbar2l1tex_read_sectors_mem_lg_op_ld_bandwidth = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio")
-        {
-            metric_obj.l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__inst_executed_op_global_ld.sum")
-        {
-            metric_obj.smsp__inst_executed_op_global_ld = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "memory_l2_theoretical_sectors_global")
-        {
-            metric_obj.memory_l2_theoretical_sectors_global = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "memory_l2_theoretical_sectors_global_ideal")
-        {
-            metric_obj.memory_l2_theoretical_sectors_global_ideal = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "memory_l1_wavefronts_shared")
-        {
-            metric_obj.memory_l1_wavefronts_shared = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "memory_l1_wavefronts_shared_ideal")
-        {
-            metric_obj.memory_l1_wavefronts_shared_ideal = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "sm__sass_inst_executed_op_texture.sum")
-        {
-            metric_obj.sm__sass_inst_executed_op_texture = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sectors_pipe_tex_mem_texture.sum")
-        {
-            metric_obj.l1tex__t_sectors_pipe_tex_mem_texture = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sector_pipe_tex_mem_texture_op_tex_hit_rate.pct")
-        {
-            metric_obj.l1tex__t_sector_pipe_tex_mem_texture_op_tex_hit_rate = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__sass_average_data_bytes_per_wavefront_mem_shared_op_ld.pct")
-        {
-            metric_obj.smsp__sass_average_data_bytes_per_wavefront_mem_shared_op_ld = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum")
-        {
-            metric_obj.l1tex__t_sectors_pipe_lsu_mem_local_op_st = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sector_pipe_lsu_mem_local_op_st_hit_rate.pct")
-        {
-            metric_obj.l1tex__t_sector_pipe_lsu_mem_local_op_st_hit_rate = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "l1tex__t_sector_pipe_lsu_mem_global_op_st_hit_rate.pct")
-        {
-            metric_obj.l1tex__t_sector_pipe_lsu_mem_global_op_st_hit_rate = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "lts__t_sector_op_write_hit_rate.pct")
-        {
-            metric_obj.lts__t_sector_op_write_hit_rate = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "lts__t_sector_hit_rate.pct")
-        {
-            metric_obj.lts__t_sector_hit_rate = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "sm__sass_inst_executed_op_global_st.sum")
-        {
-            metric_obj.sm__sass_inst_executed_op_global_st = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "sm__sass_inst_executed_op_local_st.sum")
-        {
-            metric_obj.sm__sass_inst_executed_op_local_st = std::stod(i[metric_value_index]);
-        }
-        if (i[metric_name_index] == "smsp__inst_executed_op_ldgsts.sum")
-        {
-            metric_obj.smsp__inst_executed_op_ldgsts = std::stod(i[metric_value_index]);
+    for (const auto &row : data)
+    {
+        // Validate row width
+        if (static_cast<int>(row.size()) <= idx_metric_name || static_cast<int>(row.size()) <= idx_metric_value || static_cast<int>(row.size()) <= idx_kernel_name) continue;
+        if (idx_section_name >= 0 && static_cast<int>(row.size()) > idx_section_name)
+        {
+            if (row[idx_section_name] != "Command line profiler metrics") continue;
         }
 
-        if (i.size() > 9) {
-            std::string id_name = i[9]; // key of the map is the name of the kernel
-            kernel_metrics kernel_obj = {std::stoi(i[1]), i[9], metric_obj};
-            metric_map[id_name] = kernel_obj;
+        const std::string &kernel_name = row[idx_kernel_name];
+        if (kernel_name.empty()) continue;
+
+        // Get or create kernel entry (value-init to zero-initialize metrics)
+        auto [it, inserted] = metric_map.try_emplace(kernel_name, kernel_metrics{});
+        kernel_metrics &kernel_obj = it->second;
+        if (inserted)
+        {
+            // Prefer "ID" if present, else fallback to Process ID (index 1)
+            int id_val = 0;
+            if (idx_id >= 0 && static_cast<int>(row.size()) > idx_id)
+            {
+                try { id_val = std::stoi(row[idx_id]); } catch (...) { id_val = 0; }
+            }
+            else if (static_cast<int>(row.size()) > 1)
+            {
+                try { id_val = std::stoi(row[1]); } catch (...) { id_val = 0; }
+            }
+            kernel_obj.id = id_val;
+            kernel_obj.kernel_name = kernel_name;
         }
+
+        const std::string &metric_name = row[idx_metric_name];
+        const double value = parse_metric_value(row[idx_metric_value]);
+
+        if (metric_name == "smsp__sass_inst_executed.sum")
+        {
+            kernel_obj.metrics_list.smsp__sass_inst_executed = value;
+        }
+        if (metric_name == "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum") 
+        { 
+            kernel_obj.metrics_list.l1tex__t_sectors_pipe_lsu_mem_global_op_st = value; 
+        }
+        if (metric_name == "smsp__sass_inst_executed_op_global.sum") 
+        { 
+            kernel_obj.metrics_list.smsp__sass_inst_executed_op_global = value; 
+        }
+        if (metric_name == "smsp__warps_active.sum")
+        {
+            kernel_obj.metrics_list.smsp__warps_active = value;
+        }
+        if (metric_name == "smsp__warp_issue_stalled_barrier_per_warp_active.pct")
+        {
+            kernel_obj.metrics_list.smsp__warp_issue_stalled_barrier_per_warp_active = value;
+        }
+        if (metric_name == "smsp__warp_issue_stalled_membar_per_warp_active.pct")
+        {
+            kernel_obj.metrics_list.smsp__warp_issue_stalled_membar_per_warp_active = value;
+        }
+        if (metric_name == "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct")
+        {
+            kernel_obj.metrics_list.smsp__warp_issue_stalled_short_scoreboard_per_warp_active = value;
+        }
+        if (metric_name == "smsp__warp_issue_stalled_wait_per_warp_active.pct")
+        {
+            kernel_obj.metrics_list.smsp__warp_issue_stalled_wait_per_warp_active = value;
+        }
+        if (metric_name == "smsp__thread_inst_executed_per_inst_executed.ratio")
+        {
+            kernel_obj.metrics_list.smsp__thread_inst_executed_per_inst_executed = value;
+        }
+        if (metric_name == "sm__sass_branch_targets.avg")
+        {
+            kernel_obj.metrics_list.sm__sass_branch_targets = value;
+        }
+        if (metric_name == "sm__sass_branch_targets_threads_divergent.avg")
+        {
+            kernel_obj.metrics_list.sm__sass_branch_targets_threads_divergent = value;
+        }
+        if (metric_name == "smsp__warp_issue_stalled_imc_miss_per_warp_active.pct")
+        {
+            kernel_obj.metrics_list.smsp__warp_issue_stalled_imc_miss_per_warp_active = value;
+        }
+        if (metric_name == "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct")
+        {
+            kernel_obj.metrics_list.smsp__warp_issue_stalled_long_scoreboard_per_warp_active = value;
+        }
+        if (metric_name == "sm__warps_active.avg.pct_of_peak_sustained_active")
+        {
+            kernel_obj.metrics_list.sm__warps_active = value;
+        }
+        if (metric_name == "smsp__warp_issue_stalled_lg_throttle_per_warp_active.pct")
+        {
+            kernel_obj.metrics_list.smsp__warp_issue_stalled_lg_throttle_per_warp_active = value;
+        }
+        if (metric_name == "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct")
+        {
+            kernel_obj.metrics_list.smsp__warp_issue_stalled_mio_throttle_per_warp_active = value;
+        }
+        if (metric_name == "smsp__warp_issue_stalled_tex_throttle_per_warp_active.pct")
+        {
+            kernel_obj.metrics_list.smsp__warp_issue_stalled_tex_throttle_per_warp_active = value;
+        }
+        if (metric_name == "sm__sass_inst_executed_op_global_red.sum")
+        {
+            kernel_obj.metrics_list.sm__sass_inst_executed_op_global_red = value;
+        }
+        if (metric_name == "sm__sass_inst_executed_op_shared_atom.sum")
+        {
+            kernel_obj.metrics_list.sm__sass_inst_executed_op_shared_atom = value;
+        }
+        if (metric_name == "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum")
+        {
+            kernel_obj.metrics_list.l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld = value;
+        }
+        if (metric_name == "sm__sass_inst_executed_op_shared_ld.sum")
+        {
+            kernel_obj.metrics_list.sm__sass_inst_executed_op_shared_ld = value;
+        }
+        if (metric_name == "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum")
+        {
+            kernel_obj.metrics_list.l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st = value;
+        }
+        if (metric_name == "sm__sass_inst_executed_op_shared_st.sum")
+        {
+            kernel_obj.metrics_list.sm__sass_inst_executed_op_shared_st = value;
+        }
+        if (metric_name == "smsp__sass_average_data_bytes_per_wavefront_mem_shared.pct")
+        {
+            kernel_obj.metrics_list.smsp__sass_average_data_bytes_per_wavefront_mem_shared = value;
+        }
+        if (metric_name == "smsp__inst_executed_op_local_ld.sum")
+        {
+            kernel_obj.metrics_list.smsp__inst_executed_op_local_ld = value;
+        }
+        if (metric_name == "smsp__inst_executed_op_local_st.sum")
+        {
+            kernel_obj.metrics_list.smsp__inst_executed_op_local_st = value;
+        }
+        if (metric_name == "lts__t_sectors_op_atom.sum")
+        {
+            kernel_obj.metrics_list.lts__t_sectors_op_atom = value;
+        }
+        if (metric_name == "lts__t_sectors_op_read.sum")
+        {
+            kernel_obj.metrics_list.lts__t_sectors_op_read = value;
+        }
+        if (metric_name == "lts__t_sectors_op_red.sum")
+        {
+            kernel_obj.metrics_list.lts__t_sectors_op_red = value;
+        }
+        if (metric_name == "lts__t_sectors_op_write.sum")
+        {
+            kernel_obj.metrics_list.lts__t_sectors_op_write = value;
+        }
+        if (metric_name == "l1tex__t_sector_hit_rate.pct")
+        {
+            kernel_obj.metrics_list.l1tex__t_sector_hit_rate = value;
+        }
+        if (metric_name == "sm__sass_inst_executed_op_global_ld.sum")
+        {
+            kernel_obj.metrics_list.sm__sass_inst_executed_op_global_ld = value;
+        }
+        if (metric_name == "sm__sass_inst_executed_op_local_ld.sum")
+        {
+            kernel_obj.metrics_list.sm__sass_inst_executed_op_local_ld = value;
+        }
+        if (metric_name == "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum")
+        {
+            kernel_obj.metrics_list.l1tex__t_sectors_pipe_lsu_mem_global_op_ld = value;
+        }
+        if (metric_name == "l1tex__t_sector_pipe_lsu_mem_global_op_ld_hit_rate.pct")
+        {
+            kernel_obj.metrics_list.l1tex__t_sector_pipe_lsu_mem_global_op_ld_hit_rate = value;
+        }
+        if (metric_name == "lts__t_sector_op_read_hit_rate.pct")
+        {
+            kernel_obj.metrics_list.lts__t_sector_op_read_hit_rate = value;
+        }
+        if (metric_name == "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum")
+        {
+            kernel_obj.metrics_list.l1tex__t_sectors_pipe_lsu_mem_local_op_ld = value;
+        }
+        if (metric_name == "l1tex__t_sector_pipe_lsu_mem_local_op_ld_hit_rate.pct")
+        {
+            kernel_obj.metrics_list.l1tex__t_sector_pipe_lsu_mem_local_op_ld_hit_rate = value;
+        }
+        if (metric_name == "l1tex__t_sectors_pipe_lsu_mem_global_op_red.sum")
+        {
+            kernel_obj.metrics_list.l1tex__t_sectors_pipe_lsu_mem_global_op_red = value;
+        }
+        if (metric_name == "l1tex__t_sectors_pipe_lsu_mem_global_op_atom.sum")
+        {
+            kernel_obj.metrics_list.l1tex__t_sectors_pipe_lsu_mem_global_op_atom = value;
+        }
+        if (metric_name == "l1tex__t_sector_pipe_lsu_mem_global_op_red_hit_rate.pct")
+        {
+            kernel_obj.metrics_list.l1tex__t_sector_pipe_lsu_mem_global_op_red_hit_rate = value;
+        }
+        if (metric_name == "l1tex__t_sector_pipe_lsu_mem_global_op_atom_hit_rate.pct")
+        {
+            kernel_obj.metrics_list.l1tex__t_sector_pipe_lsu_mem_global_op_atom_hit_rate = value;
+        }
+        if (metric_name == "lts__t_sector_op_red_hit_rate.pct")
+        {
+            kernel_obj.metrics_list.lts__t_sector_op_red_hit_rate = value;
+        }
+        if (metric_name == "lts__t_sector_op_atom_hit_rate.pct")
+        {
+            kernel_obj.metrics_list.lts__t_sector_op_atom_hit_rate = value;
+        }
+        if (metric_name == "sm__sass_data_bytes_mem_shared_op_atom.sum")
+        {
+            kernel_obj.metrics_list.sm__sass_data_bytes_mem_shared_op_atom = value;
+        }
+        if (metric_name == "l1tex__m_xbar2l1tex_read_sectors_mem_lg_op_ld.sum.pct_of_peak_sustained_elapsed")
+        {
+            kernel_obj.metrics_list.l1tex__m_xbar2l1tex_read_sectors_mem_lg_op_ld_bandwidth = value;
+        }
+        if (metric_name == "l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio")
+        {
+            kernel_obj.metrics_list.l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld = value;
+        }
+        if (metric_name == "smsp__inst_executed_op_global_ld.sum")
+        {
+            kernel_obj.metrics_list.smsp__inst_executed_op_global_ld = value;
+        }
+        if (metric_name == "memory_l2_theoretical_sectors_global")
+        {
+            kernel_obj.metrics_list.memory_l2_theoretical_sectors_global = value;
+        }
+        if (metric_name == "memory_l2_theoretical_sectors_global_ideal")
+        {
+            kernel_obj.metrics_list.memory_l2_theoretical_sectors_global_ideal = value;
+        }
+        if (metric_name == "memory_l1_wavefronts_shared")
+        {
+            kernel_obj.metrics_list.memory_l1_wavefronts_shared = value;
+        }
+        if (metric_name == "memory_l1_wavefronts_shared_ideal")
+        {
+            kernel_obj.metrics_list.memory_l1_wavefronts_shared_ideal = value;
+        }
+        if (metric_name == "sm__sass_inst_executed_op_texture.sum")
+        {
+            kernel_obj.metrics_list.sm__sass_inst_executed_op_texture = value;
+        }
+        if (metric_name == "l1tex__t_sectors_pipe_tex_mem_texture.sum")
+        {
+            kernel_obj.metrics_list.l1tex__t_sectors_pipe_tex_mem_texture = value;
+        }
+        if (metric_name == "l1tex__t_sector_pipe_tex_mem_texture_op_tex_hit_rate.pct")
+        {
+            kernel_obj.metrics_list.l1tex__t_sector_pipe_tex_mem_texture_op_tex_hit_rate = value;
+        }
+        if (metric_name == "smsp__sass_average_data_bytes_per_wavefront_mem_shared_op_ld.pct")
+        {
+            kernel_obj.metrics_list.smsp__sass_average_data_bytes_per_wavefront_mem_shared_op_ld = value;
+        }
+        if (metric_name == "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum")
+        {
+            kernel_obj.metrics_list.l1tex__t_sectors_pipe_lsu_mem_local_op_st = value;
+        }
+        if (metric_name == "l1tex__t_sector_pipe_lsu_mem_local_op_st_hit_rate.pct")
+        {
+            kernel_obj.metrics_list.l1tex__t_sector_pipe_lsu_mem_local_op_st_hit_rate = value;
+        }
+        if (metric_name == "l1tex__t_sector_pipe_lsu_mem_global_op_st_hit_rate.pct")
+        {
+            kernel_obj.metrics_list.l1tex__t_sector_pipe_lsu_mem_global_op_st_hit_rate = value;
+        }
+        if (metric_name == "lts__t_sector_op_write_hit_rate.pct")
+        {
+            kernel_obj.metrics_list.lts__t_sector_op_write_hit_rate = value;
+        }
+        if (metric_name == "lts__t_sector_hit_rate.pct")
+        {
+            kernel_obj.metrics_list.lts__t_sector_hit_rate = value;
+        }
+        if (metric_name == "sm__sass_inst_executed_op_global_st.sum")
+        {
+            kernel_obj.metrics_list.sm__sass_inst_executed_op_global_st = value;
+        }
+        if (metric_name == "sm__sass_inst_executed_op_local_st.sum")
+        {
+            kernel_obj.metrics_list.sm__sass_inst_executed_op_local_st = value;
+        }
+        if (metric_name == "smsp__inst_executed_op_ldgsts.sum")
+        {
+            kernel_obj.metrics_list.smsp__inst_executed_op_ldgsts = value;
+        }
+
     }
     // std::cout << metric_obj.smsp__warp_issue_stalled_long_scoreboard_per_warp_active + metric_obj.smsp__warp_issue_stalled_wait_per_warp_active << std::endl;
     // std::cout << metric_map["bodyForce(Body *, float, int)"].kernel_name << " : " << metric_map["bodyForce(Body *, float, int)"].metrics_list.smsp__warp_issue_stalled_long_scoreboard_per_warp_active + metric_map["bodyForce(Body *, float, int)"].metrics_list.smsp__warp_issue_stalled_wait_per_warp_active << std::endl;
