@@ -205,18 +205,24 @@ echo "Setting up profiling . . . . . . . . . . . . . . . "
 
 cd ${gpuscout_dir}
 echo -e "Generating binaries . . . . . . . . . . . . . . . . . . . ."
+start_static=$(date +%s.%N)
 nvdisasm -g -c ${cubin} > ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${run_prefix}-sass.txt #TODO this line necessary?
 nvdisasm -g -c ${cubin} > ${gpuscout_tmp_dir}/nvdisasm-executable-${run_prefix}-sass.txt
 cuobjdump -ptx ${executable} > ${gpuscout_tmp_dir}/nvdisasm-executable-${run_prefix}-ptx.txt
 nvdisasm -g -c -lrm=count ${cubin} > ${gpuscout_tmp_dir}/nvdisasm-registers-hpctoolkit-${run_prefix}-sass.txt #TODO this line necessary?
 nvdisasm -g -c -lrm=count ${cubin} > ${gpuscout_tmp_dir}/nvdisasm-registers-executable-${run_prefix}-sass.txt
+end_static=$(date +%s.%N)
+static_time=$(awk "BEGIN {print $end_static - $start_static}")
 
 
 # Run the generate_sampling_stalls script inside the sampling_utilities directory
 if [ "$dry_run" = false ]; then
     echo "Getting warp stall reasons . . . . . . . . . . . . . . . "
+    start_pcsampling=$(date +%s.%N)
     source ${gpuscout_dir}/sampling_utilities/generate_sampling_stalls.sh
     cp ${gpuscout_dir}/sampling_utilities/sampling_utility/pcsampling_${run_prefix}.txt ${gpuscout_tmp_dir}/pcsampling_${run_prefix}.txt
+    end_pcsampling=$(date +%s.%N)
+    pcsampling_time=$(awk "BEGIN {print $end_pcsampling - $start_pcsampling}")
 fi
 
 # Get the measurements and analysis from the measurements script
