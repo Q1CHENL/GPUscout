@@ -10,6 +10,7 @@
 #include "parser_sass_use_texture.hpp"
 #include "parser_pcsampling.hpp"
 #include "parser_metrics.hpp"
+#include "kernel_filter.hpp"
 #include "utilities/json.hpp"
 
 using json = nlohmann::json;
@@ -82,12 +83,17 @@ bool check_spatial_locality(const register_used &register_read)
 /// @param texture_analysis_map Includes read-only register data with spatial locality flag
 /// @param pc_stall_map CUPTI warp stalls
 /// @param metric_map Metric analysis
-json merge_analysis_use_texture(std::unordered_map<std::string, std::vector<register_used>> texture_analysis_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map)
+json merge_analysis_use_texture(std::unordered_map<std::string, std::vector<register_used>> texture_analysis_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map, const std::vector<std::string> &kernel_patterns)
 {
     json result;
 
     for (auto [k_sass, v_sass] : texture_analysis_map)
     {
+        if (!gpuscout_kernel_allowed(k_sass, kernel_patterns))
+        {
+            continue;
+        }
+
         json kernel_result = {
             {"occurrences", json::array()}
         };
@@ -142,17 +148,15 @@ json merge_analysis_use_texture(std::unordered_map<std::string, std::vector<regi
                 };
 
                 // Map kernel with the PC Stall map
-                for (auto [k_pc, v_pc] : pc_stall_map)
+                auto pc_it = pc_stall_map.find(k_sass);
+                if (pc_it != pc_stall_map.end())
                 {
-                    if ((k_pc == k_sass)) // analyze for the same kernel (sass analysis and pc sampling analysis)
+                    for (const auto &j : pc_it->second)
                     {
-                        for (const auto &j : v_pc)
+                        if ((index_sass.line_number == j.line_number) && (get_register_from_line(j.sass_instruction) == index_sass.write_to_register_number))
                         {
-                            if ((index_sass.line_number == j.line_number) && (get_register_from_line(j.sass_instruction) == index_sass.write_to_register_number)) // analyze for the same line numbers in the code and same registers in SASS
-                            {
-                                print_stalls_percentage(j);
-                                break;
-                            }
+                            print_stalls_percentage(j);
+                            break;
                         }
                     }
                 }
@@ -168,17 +172,15 @@ json merge_analysis_use_texture(std::unordered_map<std::string, std::vector<regi
         }
 
         // Map kernel with metrics collected
-        for (auto [k_metric, v_metric] : metric_map)
+        auto m_it = metric_map.find(k_sass);
+        if (m_it != metric_map.end())
         {
-            if ((k_metric == k_sass)) // analyze for the same kernel (sass analysis and metric analysis)
-            {
-                std::cout << "INFO  ::  Check data flow in texture memory, if you modify your code to use textures" << std::endl;
-                texture_data_memory_flow(metric_map[k_metric]); // show the memory flow (to check texture memory flow)
+            const auto &v_metric = m_it->second;
+            std::cout << "INFO  ::  Check data flow in texture memory, if you modify your code to use textures" << std::endl;
+            texture_data_memory_flow(metric_map[k_sass]);
 
-                // copied use_texture_memory_analysis from stalls_static_analysis_relation() method
-                std::cout << "If you are using texture memory, check Tex Throttle: " << v_metric.metrics_list.smsp__warp_issue_stalled_tex_throttle_per_warp_active << " %" << std::endl;
-                std::cout << "If you are using texture memory, check Long Scoreboard: " << v_metric.metrics_list.smsp__warp_issue_stalled_long_scoreboard_per_warp_active << " %" << std::endl;
-            }
+            std::cout << "If you are using texture memory, check Tex Throttle: " << v_metric.metrics_list.smsp__warp_issue_stalled_tex_throttle_per_warp_active << " %" << std::endl;
+            std::cout << "If you are using texture memory, check Long Scoreboard: " << v_metric.metrics_list.smsp__warp_issue_stalled_long_scoreboard_per_warp_active << " %" << std::endl;
         }
 
         result[k_sass] = kernel_result;
@@ -201,7 +203,13 @@ int main(int argc, char **argv)
     int save_as_json = std::strcmp(argv[6], "true") == 0;
     std::string json_output_dir = argv[7];
 
-    json result = merge_analysis_use_texture(texture_analysis_map, pc_stall_map, metric_map);
+    std::vector<std::string> kernel_patterns;
+    if (argc >= 9)
+    {
+        kernel_patterns = gpuscout_parse_comma_list(argv[8]);
+    }
+
+    json result = merge_analysis_use_texture(texture_analysis_map, pc_stall_map, metric_map, kernel_patterns);
 
     if (save_as_json)
     {

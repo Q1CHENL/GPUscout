@@ -4,87 +4,147 @@
 #@(#) This is the measurements script that collects the Nsight Compute metrics and executes the SASS analysis code
 
 echo "======================================================================================================"
+
+# Optional CLI overrides (set by GPUscout.sh)
+# - kernels_cli: comma-separated kernel name patterns
+# - analyses_cli: comma-separated analysis names
+
+trim_item () {
+    local s="$1"
+    # shellcheck disable=SC2001
+    s="$(echo "$s" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    echo "$s"
+}
+
+parse_csv_to_array () {
+    local csv="$1"
+    local out_name="$2"
+    eval "$out_name=()"
+    IFS=',' read -ra _tmp <<< "$csv"
+    for item in "${_tmp[@]}"; do
+        item="$(trim_item "$item")"
+        if [ -n "$item" ]; then
+            eval "$out_name+=(\"$item\")"
+        fi
+    done
+}
+
+# Default kernel patterns (for NCU) unless overridden by --kernels
+top_kernels=(
+    loop_compact
+)
+
+# Reference kernel patterns (kept for convenience; use --kernels to select without editing):
+#
+# gpu_acc_sort_blocks.cpp
+#   order_GIDs_kernel
+#   construct_columns_kernel
+#   blocksID_mapped_dim0_kernel
+#   blocksID_mapped_dim1_kernel
+#   blocksID_mapped_dim2_kernel
+#
+# spatial_cell_gpu.cpp
+#   population_increment_kernel
+#   population_scale_kernel
+#   add_blocks_from_buffer_kernel
+#   update_velocity_blocks_kernel
+#   update_blockparameters_kernel
+#   resize_vbc_kernel_pre
+#   resize_vbc_kernel_post
+#   update_velocity_block_content_lists_kernel
+#   update_velocity_halo_kernel
+#   update_neighbour_halo_kernel
+#
+# gpu_acc_map.cpp
+#   reorder_blocks_by_dimension_kernel
+#   count_columns_kernel
+#   offsets_into_columns_kernel
+#   evaluate_column_extents_kernel
+#   acceleration_kernel
+#
+# gpu_dt.cpp
+#   reduce_v_dt_kernel
+#
+# gpu_moments.cpp
+#   first_moments_kernel
+#   second_moments_kernel
+#
+# gpu_trans_map_amr.cpp
+#   translation_kernel
+#   gather_union_of_blocks_kernel
+#   remote_increment_kernel
+#
+# split_tools.h / other libs
+#   scan_add
+#   scan_reduce
+#   split_prescan
+#   split_compact
+#   split_compact_keys
+#   split_compact_keys_raw
+#   split_compact_raw
+#   scan_reduce_raw
+#   block_compact
+#   block_compact_keys
+#   loop_compact
+#   loop_compact_keys
+
+if [ -n "${kernels_cli}" ]; then
+    parse_csv_to_array "${kernels_cli}" top_kernels
+    if [ "${#top_kernels[@]}" -eq 0 ]; then
+        echo "ERROR: --kernels provided but empty."
+        exit 1
+    fi
+fi
+
+# Default analyses unless overridden by --analysis
+enabled_analyses=(
+    warp_divergence
+)
+
+# Reference analyses (use --analysis to select without editing):
+#   register_spilling
+#   use_restrict
+#   vectorization
+#   global_atomics
+#   warp_divergence
+#   use_texture
+#   use_shared
+#   datatype_conversion
+#   deadlock_detection
+
+if [ -n "${analyses_cli}" ]; then
+    parse_csv_to_array "${analyses_cli}" enabled_analyses
+    if [ "${#enabled_analyses[@]}" -eq 0 ]; then
+        echo "ERROR: --analysis provided but empty."
+        exit 1
+    fi
+fi
+
+is_supported_analysis () {
+    case "$1" in
+        register_spilling|use_restrict|vectorization|global_atomics|warp_divergence|use_texture|use_shared|datatype_conversion|deadlock_detection)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+for a in "${enabled_analyses[@]}"; do
+    if ! is_supported_analysis "$a"; then
+        echo "ERROR: Unknown analysis in enabled_analyses/--analysis: '$a'"
+        echo "Supported: register_spilling,use_restrict,vectorization,global_atomics,warp_divergence,use_texture,use_shared,datatype_conversion,deadlock_detection"
+        exit 1
+    fi
+done
+
 if [ "$dry_run" = false ]; then
     echo "Collecting NCU metrics . . . . . . . . . . . . . . . "
     start_metrics=$(date +%s.%N)
 
     metrics_out="${run_prefix}_metrics_list"
 
-    top_kernels=(
-        # gpu_acc_sort_blocks.cpp
-        # "order_GIDs_kernel"
-        # "construct_columns_kernel" # hotspot kernel
-        # "blocksID_mapped_dim0_kernel"
-        # "blocksID_mapped_dim1_kernel"
-        # "blocksID_mapped_dim2_kernel"
-
-        # spatial_cell_gpu.cpp
-        # spatial_cell_gpu.hpp
-        # "population_increment_kernel" # requires set fluffiness=1.0 in cfg file
-        # "population_scale_kernel" # requires set fluffiness=1.0 in cfg file
-        # "add_blocks_from_buffer_kernel"
-
-        # "update_velocity_blocks_kernel"
-        # "update_blockparameters_kernel" # requires multi-rank run
-        # "resize_vbc_kernel_pre"
-        # "resize_vbc_kernel_post" # 0% Warp Divergence
-        # "update_velocity_block_content_lists_kernel"
-        # "update_velocity_halo_kernel"
-        # "update_neighbour_halo_kernel"
-
-        # gpu_acc_map.cpp
-        # "reorder_blocks_by_dimension_kernel"
-        # "count_columns_kernel"
-        # "offsets_into_columns_kernel"
-        # "evaluate_column_extents_kernel"
-        # "acceleration_kernel"
-
-        # # gpu_acc_semilag.cpp
-        # "printVBCsizekernel" # debug kernel, usage commented out
-
-        # # gpu_dt.cpp
-        # "reduce_v_dt_kernel" # need skip 0, skip 5 might produce no data because it is called not very often
-
-        # gpu_moments.cpp
-        # "first_moments_kernel"
-        # "second_moments_kernel"
-
-        # gpu_trans_map_amr.cpp
-        # "translation_kernel"
-        # "gather_union_of_blocks_kernel"
-        # "remote_increment_kernel" # requires multi-rank run
-
-        # hashinator
-        # kernels_NVIDIA.h
-        # reset_all_to_empty # can be triggered by gpu_acc_map.cubin
-        # reset_to_empty # can be triggered by gpu_moments.cubin
-        # insert_kernel # (templated overloads) # can be triggered by gpu_moments.cubin
-        # insert_index_kernel
-        # delete_kernel
-        # retrieve_kernel # (templated overloads)
-
-        # split_tools.h
-        # scan_add
-        # scan_reduce
-        # split_prescan # can be triggered by gpu_moments.cubin
-        # split_compact # can be triggered by gpu_trans_map_amr.cubin
-        # split_compact_keys # can be triggered by gpu_trans_map_amr.cubin
-        # split_compact_keys_raw
-        # split_compact_raw # can be triggered by gpu_moments.cubin
-        # scan_reduce_raw # can be triggered by gpu_moments.cubin
-        # block_compact # can be triggered by gpu_moments.cubin
-        # block_compact_keys # can be triggered by gpu_trans_map_amr.cubin
-        loop_compact # can be triggered by gpu_acc_map.cubin and spatial_cell_gpu.cubin
-        # loop_compact_keys # can be triggered by spatial_cell_gpu.cubin
-
-        # zfp
-        # cudaDecode1
-        # cudaDecode2
-        # cudaDecode3
-        # cudaEncode1
-        # cudaEncode2
-        # cudaEncode
-    )
 
     # Append only CSV data rows from a per-kernel NCU CSV.
     append_ncu_csv_rows () {
@@ -114,26 +174,7 @@ if [ "$dry_run" = false ]; then
         echo "Profiling NCU metrics for kernel pattern: ${kernel}"
         tmp_csv="$(mktemp)"
 
-        # ------------------------------------------------------------------
-        # Select which analyses to run (and which metrics to collect).
-        #
-        # Comment analyses in/out just like `top_kernels`.
-        #
-        # NOTE:
-        # - Metrics collection is derived from this list (union of required metrics).
-        # - Only the selected analyses are executed in the merge stage below.
-        # ------------------------------------------------------------------
-        enabled_analyses=(
-            # register_spilling
-            # use_restrict
-            # vectorization
-            # global_atomics
-            warp_divergence
-            # use_texture
-            # use_shared
-            # datatype_conversion
-            # deadlock_detection
-        )
+
 
         # Build a comma-separated metric list for NCU (de-duplicated).
         # If `json=true`, include metrics needed by JSON export as well.
@@ -306,6 +347,12 @@ if [ "$dry_run" = false ]; then
 
         metrics_csv="$(_metrics_csv)"
 
+        if [ -z "${metrics_csv}" ]; then
+            echo "Skipping NCU metrics for kernel pattern '${kernel}' (no metrics required for selected analyses and JSON export is off)."
+            rm -f "${tmp_csv}"
+            continue
+        fi
+
         ncu -f --csv --log-file "${tmp_csv}" --print-units base --print-kernel-base mangled \
             --kernel-name "${kernel}" -s 5 --launch-count 1 \
             --metrics "${metrics_csv}" \
@@ -315,12 +362,11 @@ ${executable} ${args}
         append_ncu_csv_rows "${tmp_csv}" "${metrics_out}"
     done
 
-    if [ ! -f "${metrics_out}" ]; then
-        echo "ERROR: NCU did not produce any CSV rows for the selected kernels."
-        exit 1
+    if [ -f "${metrics_out}" ]; then
+        mv "${metrics_out}" "${gpuscout_tmp_dir}/${metrics_out}"
+    else
+        echo "INFO: NCU did not produce any CSV rows for the selected kernels (or NCU was skipped due to empty metric list)."
     fi
-
-    mv "${metrics_out}" "${gpuscout_tmp_dir}/${metrics_out}"
     end_metrics=$(date +%s.%N)
     metrics_time=$(awk "BEGIN {print $end_metrics - $start_metrics}")
 fi
@@ -350,47 +396,47 @@ for analysis in "${enabled_analyses[@]}"; do
         register_spilling)
             echo "======================================================================================================"
             echo "Combining above results for register spilling analysis . . . . . . . . . . . . . . . "
-            timed_run "register spilling analysis" ./merge_analysis_register_spilling ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${gpuscout_tmp_dir}/nvdisasm-registers-executable-${executable_filename}-sass.txt ${json} ${gpuscout_output_dir} ${sms}
+            timed_run "register spilling analysis" ./merge_analysis_register_spilling ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${gpuscout_tmp_dir}/nvdisasm-registers-executable-${executable_filename}-sass.txt ${json} ${gpuscout_output_dir} ${sms} "${kernels_cli}"
             ;;
         use_restrict)
             echo "======================================================================================================"
             echo "Combining above results for using __restrict__ analysis . . . . . . . . . . . . . . . "
-            timed_run "use __restrict__ analysis" ./merge_analysis_use_restrict ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${gpuscout_tmp_dir}/nvdisasm-registers-hpctoolkit-${executable_filename}-sass.txt ${json} ${gpuscout_output_dir}
+            timed_run "use __restrict__ analysis" ./merge_analysis_use_restrict ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${gpuscout_tmp_dir}/nvdisasm-registers-hpctoolkit-${executable_filename}-sass.txt ${json} ${gpuscout_output_dir} "${kernels_cli}"
             ;;
         vectorization)
             echo "======================================================================================================"
             echo "Combining above results for vectorization analysis . . . . . . . . . . . . . . . "
-            timed_run "vectorization analysis" ./merge_analysis_vectorization ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${gpuscout_tmp_dir}/nvdisasm-registers-hpctoolkit-${executable_filename}-sass.txt ${json} ${gpuscout_output_dir}
+            timed_run "vectorization analysis" ./merge_analysis_vectorization ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${gpuscout_tmp_dir}/nvdisasm-registers-hpctoolkit-${executable_filename}-sass.txt ${json} ${gpuscout_output_dir} "${kernels_cli}"
             ;;
         global_atomics)
             echo "======================================================================================================"
             echo "Combining above results for global atomics analysis . . . . . . . . . . . . . . . "
-            timed_run "global atomics analysis" ./merge_analysis_global_atomics ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${json} ${gpuscout_output_dir}
+            timed_run "global atomics analysis" ./merge_analysis_global_atomics ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${json} ${gpuscout_output_dir} "${kernels_cli}"
             ;;
         warp_divergence)
             echo "======================================================================================================"
             echo "Combining above results for warp divergence analysis . . . . . . . . . . . . . . . "
-            timed_run "warp divergence analysis" ./merge_analysis_warp_divergence ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${json} ${gpuscout_output_dir}
+            timed_run "warp divergence analysis" ./merge_analysis_warp_divergence ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${json} ${gpuscout_output_dir} "${kernels_cli}"
             ;;
         use_texture)
             echo "======================================================================================================"
             echo "Combining above results for using texture memory analysis . . . . . . . . . . . . . . . "
-            timed_run "use texture memory analysis" ./merge_analysis_use_texture ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${json} ${gpuscout_output_dir}
+            timed_run "use texture memory analysis" ./merge_analysis_use_texture ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${json} ${gpuscout_output_dir} "${kernels_cli}"
             ;;
         use_shared)
             echo "======================================================================================================"
             echo "Combining above results for using shared memory analysis . . . . . . . . . . . . . . . "
-            timed_run "use shared memory analysis" ./merge_analysis_use_shared ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${json} ${gpuscout_output_dir}
+            timed_run "use shared memory analysis" ./merge_analysis_use_shared ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${json} ${gpuscout_output_dir} "${kernels_cli}"
             ;;
         datatype_conversion)
             echo "======================================================================================================"
             echo "Combining above results for datatype conversion analysis . . . . . . . . . . . . . . . "
-            timed_run "datatype conversion analysis" ./merge_analysis_datatype_conversion ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${json} ${gpuscout_output_dir}
+            timed_run "datatype conversion analysis" ./merge_analysis_datatype_conversion ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${json} ${gpuscout_output_dir} "${kernels_cli}"
             ;;
         deadlock_detection)
             echo "======================================================================================================"
             echo "Combining above results for deadlock detection . . . . . . . . . . . . . . . "
-            timed_run "deadlock detection analysis" ./merge_analysis_deadlock_detection ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${json} ${gpuscout_output_dir}
+            timed_run "deadlock detection analysis" ./merge_analysis_deadlock_detection ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${json} ${gpuscout_output_dir} "${kernels_cli}"
             ;;
         *)
             echo "ERROR: Unknown analysis name in enabled_analyses (merge stage): $analysis"
@@ -406,7 +452,7 @@ if [ "$json" = true ]; then
 echo "======================================================================================================"
 echo "Generating JSON output . . . . . . . . . . . . . . . "
 
-./save_to_json ${gpuscout_output_dir} ${gpuscout_tmp_dir}/result-${run_prefix} ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-registers-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${sms}
+./save_to_json ${gpuscout_output_dir} ${gpuscout_tmp_dir}/result-${run_prefix} ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-registers-executable-${executable_filename}-sass.txt ${gpuscout_tmp_dir}/nvdisasm-executable-${executable_filename}-ptx.txt ${gpuscout_tmp_dir}/pcsampling_${executable_filename}.txt ${gpuscout_tmp_dir}/${run_prefix}_metrics_list ${sms} "${kernels_cli}"
 
 fi
 

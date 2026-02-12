@@ -9,13 +9,17 @@ usage() {
     echo "  -e | --executable : Path to the executable (compiled with nvcc)."
     echo "  -c | --cubin : Path to the cubin file (compiled with nvcc, with -cubin). If left empty, the same path as executable and the name cubin-<executable> will be assumed."
     echo "  -a | --args : Arguments for running the binary. e.g. --args=\"64 2 2 temp_64 power_64 output_64.txt\""
+    echo "  --kernels : Comma-separated list of kernel name patterns to include (limits NCU and merge stage output)."
+    echo "              Example: --kernels=kernelA,kernelB"
+    echo "  --analysis : Comma-separated list of analyses to run (replaces editing measurements.sh)."
+    echo "              Supported: register_spilling,use_restrict,vectorization,global_atomics,warp_divergence,use_texture,use_shared,datatype_conversion,deadlock_detection"
     echo "  --sm_count : Can be used to specify the number of streaming multiprocessors of the current GPU, as this will be used in calculations (default: 16)"
     echo "  -j | --json : Save a JSON-formatted version of the output (Needed for the use of GPUscout-GUI)"
     exit 1
 }
 
 # Parse command-line options
-options=$(getopt -o hve:c:a:j -l help,dry_run,verbose,executable:,cubin:,args:,sm_count:,json -- "$@")
+options=$(getopt -o hve:c:a:j -l help,dry_run,verbose,executable:,cubin:,args:,kernels:,analysis:,sm_count:,json -- "$@")
 
 if [ $? -ne 0 ]; then
     echo "Error: Invalid option."
@@ -30,6 +34,8 @@ json=false
 executable=""
 cubin=""
 args=""
+kernels_cli=""
+analyses_cli=""
 sms=16
 while true; do
     case "$1" in
@@ -46,6 +52,14 @@ while true; do
             ;;
         -a | --args)
             args="$2"
+            shift 2
+            ;;
+        --kernels)
+            kernels_cli="$2"
+            shift 2
+            ;;
+        --analysis)
+            analyses_cli="$2"
             shift 2
             ;;
         --dry_run)
@@ -122,6 +136,8 @@ fi
 echo "==== Executable: $executable"
 echo "==== Cubin:      $cubin"
 echo "==== Arguments for the executable file: \"$args\""
+echo "==== Kernels (override): ${kernels_cli}"
+echo "==== Analyses (override): ${analyses_cli}"
 echo "==== Dry-run: $dry_run"
 echo "==== Verbose: $verbose"
 echo "==== JSON Output: $json"

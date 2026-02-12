@@ -11,6 +11,7 @@
 #include "parser_pcsampling.hpp"
 #include "parser_metrics.hpp"
 #include "parser_liveregisters.hpp"
+#include "kernel_filter.hpp"
 #include "utilities/json.hpp"
 
 using json = nlohmann::json;
@@ -42,12 +43,17 @@ void print_stalls_percentage(const pc_issue_samples &index)
 /// @param pc_stall_map CUPTI warp stalls
 /// @param metric_map Metric analysis
 /// @param live_register_map Currently used (or live) register count denoting register pressure
-json merge_analysis_vectorize(std::unordered_map<std::string, load_counter> vectorize_analysis_map, std::unordered_map<std::string, std::vector<register_data>> register_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map, std::unordered_map<std::string, std::vector<live_registers>> live_register_map)
+json merge_analysis_vectorize(std::unordered_map<std::string, load_counter> vectorize_analysis_map, std::unordered_map<std::string, std::vector<register_data>> register_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map, std::unordered_map<std::string, std::vector<live_registers>> live_register_map, const std::vector<std::string> &kernel_patterns)
 {
     json result;
 
     for (auto [k_sass, v_sass] : vectorize_analysis_map)
     {
+        if (!gpuscout_kernel_allowed(k_sass, kernel_patterns))
+        {
+            continue;
+        }
+
         json kernel_result = {
             {"total", 0},
             {"occurrences", json::array()}
@@ -62,12 +68,11 @@ json merge_analysis_vectorize(std::unordered_map<std::string, load_counter> vect
         std::cout << "--------------------- Vectorized load analysis for kernel: " << k_sass << "   --------------------- " << std::endl;
         std::cout << "WARNING   ::  Total number of non-vectorized global load SASS instructions for this kernel: " << v_sass.global_load_count << std::endl;
 
-        for (auto [k_reg, v_reg] : register_map)
+        auto reg_it = register_map.find(k_sass);
+        if (reg_it != register_map.end())
         {
-            if (k_reg == k_sass) // analysis for the same kernel
+            for (auto index_sass : reg_it->second)
             {
-                for (auto index_sass : v_reg)
-                {
                     json line_result;
                     // Base registers with no unrolling will show 0, hence need to ignore those counts
                     if (((index_sass.unrolls.size() - std::count(index_sass.unrolls.begin(), index_sass.unrolls.end(), 0)) > 0) && (index_sass.reg_load_type == VEC_32))
@@ -107,14 +112,13 @@ json merge_analysis_vectorize(std::unordered_map<std::string, load_counter> vect
                     }
 
                     // Map kernel with the PC Stall map
-                    for (auto [k_pc, v_pc] : pc_stall_map)
+                    auto pc_it = pc_stall_map.find(k_sass);
+                    if (pc_it != pc_stall_map.end())
                     {
-                        if ((k_pc == k_sass)) // analyze for the same kernel (sass analysis and pc sampling analysis)
+                        for (const auto &j : pc_it->second)
                         {
-                            for (const auto &j : v_pc)
+                            if ((index_sass.line_number == j.line_number) && (index_sass.base == read_register_pair(j.sass_instruction).first))
                             {
-                                if ((index_sass.line_number == j.line_number) && (index_sass.base == read_register_pair(j.sass_instruction).first)) // analyze for the same line numbers in the code and same registers in SASS
-                                {
                                     /*
                                     Example: Register R12 in line number 28 in your code (for example) has 1 unrolls done by the compiler
                                     This line has a SASS instruction:    (06f0) LDG.E.SYS R15, [R12+-0x4] ;
@@ -145,26 +149,23 @@ json merge_analysis_vectorize(std::unordered_map<std::string, load_counter> vect
                                     {
                                         print_stalls_percentage(j);
                                     }
-                                    break; // once register matched/found, get out of the loop
-                                }
+                                break;
                             }
                         }
                     }
 
                     if (!line_result.is_null())
                         kernel_result["occurrences"].push_back(line_result);
-                }
             }
         }
 
         // Map kernel with metrics collected
-        for (auto [k_metric, v_metric] : metric_map)
+        auto m_it = metric_map.find(k_sass);
+        if (m_it != metric_map.end())
         {
-            if ((k_metric == k_sass)) // analyze for the same kernel (sass analysis and metric analysis)
-            {
-                std::cout << "If you are using non-vectorized load/store, check Long Scoreboard: " << v_metric.metrics_list.smsp__warp_issue_stalled_long_scoreboard_per_warp_active << " % per warp active" << std::endl;
-                std::cout << "INFO  ::  Using vectorized load increases the register pressure and hence might affect occupancy. Occupancy achieved: " << v_metric.metrics_list.sm__warps_active << " %" << std::endl;
-            }
+            const auto &v_metric = m_it->second;
+            std::cout << "If you are using non-vectorized load/store, check Long Scoreboard: " << v_metric.metrics_list.smsp__warp_issue_stalled_long_scoreboard_per_warp_active << " % per warp active" << std::endl;
+            std::cout << "INFO  ::  Using vectorized load increases the register pressure and hence might affect occupancy. Occupancy achieved: " << v_metric.metrics_list.sm__warps_active << " %" << std::endl;
         }
 
         result[k_sass] = kernel_result;
@@ -192,7 +193,13 @@ int main(int argc, char **argv)
     int save_as_json = std::strcmp(argv[7], "true") == 0;
     std::string json_output_dir = argv[8];
 
-    json result = merge_analysis_vectorize(vectorize_analysis_map, register_map, pc_stall_map, metric_map, live_register_map);
+    std::vector<std::string> kernel_patterns;
+    if (argc >= 10)
+    {
+        kernel_patterns = gpuscout_parse_comma_list(argv[9]);
+    }
+
+    json result = merge_analysis_vectorize(vectorize_analysis_map, register_map, pc_stall_map, metric_map, live_register_map, kernel_patterns);
 
     if (save_as_json)
     {

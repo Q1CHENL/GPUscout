@@ -10,6 +10,7 @@
 #include "parser_ptx_global_atomics.hpp"
 #include "parser_pcsampling.hpp"
 #include "parser_metrics.hpp"
+#include "kernel_filter.hpp"
 #include "utilities/json.hpp"
 #include <cstring>
 #include <iostream>
@@ -42,12 +43,17 @@ void print_stalls_percentage(const pc_issue_samples &index)
 /// @param branch_map Target branch information to detect if the atomic operation is in a for-loop
 /// @param pc_stall_map CUPTI warp stalls
 /// @param metric_map Metric analysis
-json merge_analysis_global_shared_atomic(std::unordered_map<std::string, atomic_counter> ptx_atomic_map, std::unordered_map<std::string, std::vector<branch_counter>> branch_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map)
+json merge_analysis_global_shared_atomic(std::unordered_map<std::string, atomic_counter> ptx_atomic_map, std::unordered_map<std::string, std::vector<branch_counter>> branch_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map, const std::vector<std::string> &kernel_patterns)
 {
     json result;
 
     for (auto [k_sass, v_sass] : ptx_atomic_map)
     {
+        if (!gpuscout_kernel_allowed(k_sass, kernel_patterns))
+        {
+            continue;
+        }
+
         json kernel_result = {
             {"occurrences", json::array()},
         };
@@ -64,26 +70,24 @@ json merge_analysis_global_shared_atomic(std::unordered_map<std::string, atomic_
             std::cout << "WARNING  ::  Number of global atomic instructions in the ptx file: " << v_sass.atom_global_count << " detected" << std::endl;
             for (const auto &i : v_sass.atom_global_line_number)
             {
-                for (const auto [k_branch, v_branch] : branch_map)
+                auto b_it = branch_map.find(k_sass);
+                if (b_it != branch_map.end())
                 {
-                    for (const auto &k : v_branch)
+                    for (const auto &k : b_it->second)
                     {
-                        if (k_branch == k_sass)
+                        if ((k.atom_global_line_number.find(std::get<0>(i)) != k.atom_global_line_number.end()) && (k.target_branch_line_number != 0))
                         {
-                            if ((k.atom_global_line_number.find(std::get<0>(i)) != k.atom_global_line_number.end()) && (k.target_branch_line_number != 0))
-                            {
-                                std::cout << "Global atomic operation found at line number " << std::get<0>(i) << " of your source code. ";
-                                if (k.inside_for_loop == true)
-                                    std::cout << "This atomic instruction is found inside a for-loop" << std::endl;
+                            std::cout << "Global atomic operation found at line number " << std::get<0>(i) << " of your source code. ";
+                            if (k.inside_for_loop == true)
+                                std::cout << "This atomic instruction is found inside a for-loop" << std::endl;
 
-                                kernel_result["occurrences"].push_back({
-                                    {"severity", "WARNING"},
-                                    {"line_number", std::get<0>(i)},
-                                    {"line_number_raw", std::get<1>(i)},
-                                    {"in_for_loop", k.inside_for_loop},
-                                    {"is_global", true},
-                                });
-                            }
+                            kernel_result["occurrences"].push_back({
+                                {"severity", "WARNING"},
+                                {"line_number", std::get<0>(i)},
+                                {"line_number_raw", std::get<1>(i)},
+                                {"in_for_loop", k.inside_for_loop},
+                                {"is_global", true},
+                            });
                         }
                     }
                 }
@@ -99,26 +103,24 @@ json merge_analysis_global_shared_atomic(std::unordered_map<std::string, atomic_
             std::cout << "INFO  ::  Number of shared atomic instructions in the ptx file: " << v_sass.atom_shared_count << " recorded." << std::endl;
             for (const auto &i : v_sass.atom_shared_line_number)
             {
-                for (const auto [k_branch, v_branch] : branch_map)
+                auto b_it = branch_map.find(k_sass);
+                if (b_it != branch_map.end())
                 {
-                    for (const auto &k : v_branch)
+                    for (const auto &k : b_it->second)
                     {
-                        if (k_branch == k_sass)
+                        if ((k.atom_shared_line_number.find(std::get<0>(i)) != k.atom_shared_line_number.end()) && (k.target_branch_line_number != 0))
                         {
-                            if ((k.atom_shared_line_number.find(std::get<0>(i)) != k.atom_shared_line_number.end()) && (k.target_branch_line_number != 0))
-                            {
-                                std::cout << "Shared atomic operation found at line number " << std::get<0>(i) << " of your source code. ";
-                                if (k.inside_for_loop == true)
-                                    std::cout << "This atomic instruction is found inside a for-loop" << std::endl;
+                            std::cout << "Shared atomic operation found at line number " << std::get<0>(i) << " of your source code. ";
+                            if (k.inside_for_loop == true)
+                                std::cout << "This atomic instruction is found inside a for-loop" << std::endl;
 
-                                kernel_result["occurrences"].push_back({
-                                    {"severity", "INFO"},
-                                    {"line_number", std::get<0>(i)},
-                                    {"line_number_raw", std::get<1>(i)},
-                                    {"in_for_loop", k.inside_for_loop},
-                                    {"is_global", false},
-                                });
-                            }
+                            kernel_result["occurrences"].push_back({
+                                {"severity", "INFO"},
+                                {"line_number", std::get<0>(i)},
+                                {"line_number_raw", std::get<1>(i)},
+                                {"in_for_loop", k.inside_for_loop},
+                                {"is_global", false},
+                            });
                         }
                     }
                 }
@@ -130,61 +132,55 @@ json merge_analysis_global_shared_atomic(std::unordered_map<std::string, atomic_
         }
 
         // Map kernel with the PC Stall map
-        for (auto [k_pc, v_pc] : pc_stall_map)
+        auto pc_it = pc_stall_map.find(k_sass);
+        if (pc_it != pc_stall_map.end())
         {
-            if ((k_pc == k_sass)) // analyze for the same kernel (sass analysis and pc sampling analysis)
+            std::vector<int> printed_line_numbers;
+            for (const auto &j : pc_it->second)
             {
-                std::vector<int> printed_line_numbers;
-                for (const auto &j : v_pc)
+                for (const auto &i : v_sass.atom_global_line_number)
                 {
-                    for (const auto &i : v_sass.atom_global_line_number)
+                    if (std::get<0>(i) == j.line_number)
                     {
-                        if (std::get<0>(i) == j.line_number) // analyze for the same line numbers in the code
+                        if (std::find(printed_line_numbers.begin(), printed_line_numbers.end(), std::get<0>(i)) == printed_line_numbers.end())
                         {
-                            if (std::find(printed_line_numbers.begin(), printed_line_numbers.end(), std::get<0>(i)) == printed_line_numbers.end()) // Can skip the stalls for the same code line number but different SASS lines
-                            {
-                                print_stalls_percentage(j);
-                                printed_line_numbers.push_back(std::get<0>(i)); // stalls for this code line number is already printed.
-                            }
-
-                            break;
+                            print_stalls_percentage(j);
+                            printed_line_numbers.push_back(std::get<0>(i));
                         }
+                        break;
                     }
-                    for (const auto &i : v_sass.atom_shared_line_number)
+                }
+                for (const auto &i : v_sass.atom_shared_line_number)
+                {
+                    if (std::get<0>(i) == j.line_number)
                     {
-                        if (std::get<0>(i) == j.line_number) // analyze for the same line numbers in the code
+                        if (std::find(printed_line_numbers.begin(), printed_line_numbers.end(), std::get<0>(i)) == printed_line_numbers.end())
                         {
-                            if (std::find(printed_line_numbers.begin(), printed_line_numbers.end(), std::get<0>(i)) == printed_line_numbers.end()) // Can skip the stalls for the same code line number but different SASS lines
-                            {
-                                print_stalls_percentage(j);
-                                printed_line_numbers.push_back(std::get<0>(i)); // stalls for this code line number is already printed.
-                            }
-
-                            break;
+                            print_stalls_percentage(j);
+                            printed_line_numbers.push_back(std::get<0>(i));
                         }
+                        break;
                     }
                 }
             }
         }
 
         // Map kernel with metrics collected
-        for (auto [k_metric, v_metric] : metric_map)
+        auto m_it = metric_map.find(k_sass);
+        if (m_it != metric_map.end())
         {
-            if ((k_metric == k_sass)) // analyze for the same kernel (sass analysis and metric analysis)
-            {
-                std::cout << "INFO  ::  Data flow in memory for atomic operations" << std::endl;
-                atomic_data_memory_flow(metric_map[k_metric]); // show the memory flow (to check atomic/reduction operation)
+            const auto &v_metric = m_it->second;
+            std::cout << "INFO  ::  Data flow in memory for atomic operations" << std::endl;
+            atomic_data_memory_flow(metric_map[k_sass]);
 
-                // copied global_mem_atomics_analysis from stalls_static_analysis_relation() method
-                std::cout << "Incase of using global atomics, check LG Throttle: " << v_metric.metrics_list.smsp__warp_issue_stalled_lg_throttle_per_warp_active << " % per warp active" << std::endl;
-                std::cout << "Incase of using global atomics, check Long Scoreboard: " << v_metric.metrics_list.smsp__warp_issue_stalled_long_scoreboard_per_warp_active << " % per warp active" << std::endl;
-                std::cout << "INFO  ::  For high values of the above stalls, you should prefer using shared memory instead of global memory for atomics" << std::endl;
-                std::cout << "Incase of using shared atomics, check MIO throttle: " << v_metric.metrics_list.smsp__warp_issue_stalled_mio_throttle_per_warp_active << " % per warp active" << std::endl;
-                kernel_result["metrics"] = {
-                    {"atom_global_count", v_sass.atom_global_count},
-                    {"atom_shared_count", v_sass.atom_shared_count},
-                };
-            }
+            std::cout << "Incase of using global atomics, check LG Throttle: " << v_metric.metrics_list.smsp__warp_issue_stalled_lg_throttle_per_warp_active << " % per warp active" << std::endl;
+            std::cout << "Incase of using global atomics, check Long Scoreboard: " << v_metric.metrics_list.smsp__warp_issue_stalled_long_scoreboard_per_warp_active << " % per warp active" << std::endl;
+            std::cout << "INFO  ::  For high values of the above stalls, you should prefer using shared memory instead of global memory for atomics" << std::endl;
+            std::cout << "Incase of using shared atomics, check MIO throttle: " << v_metric.metrics_list.smsp__warp_issue_stalled_mio_throttle_per_warp_active << " % per warp active" << std::endl;
+            kernel_result["metrics"] = {
+                {"atom_global_count", v_sass.atom_global_count},
+                {"atom_shared_count", v_sass.atom_shared_count},
+            };
         }
 
         result[k_sass] = kernel_result;
@@ -210,7 +206,13 @@ int main(int argc, char **argv)
     int save_as_json = std::strcmp(argv[6], "true") == 0;
     std::string json_output_dir = argv[7];
 
-    json result = merge_analysis_global_shared_atomic(ptx_atomic_map, branch_map, pc_stall_map, metric_map);
+    std::vector<std::string> kernel_patterns;
+    if (argc >= 9)
+    {
+        kernel_patterns = gpuscout_parse_comma_list(argv[8]);
+    }
+
+    json result = merge_analysis_global_shared_atomic(ptx_atomic_map, branch_map, pc_stall_map, metric_map, kernel_patterns);
 
     if (save_as_json)
     {

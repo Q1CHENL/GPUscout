@@ -11,6 +11,7 @@
 #include "parser_pcsampling.hpp"
 #include "parser_metrics.hpp"
 #include "parser_liveregisters.hpp"
+#include "kernel_filter.hpp"
 #include "utilities/json.hpp"
 #include <ostream>
 #include <string>
@@ -44,12 +45,17 @@ void print_stalls_percentage(const pc_issue_samples &index)
 /// @param pc_stall_map CUPTI warp stalls
 /// @param metric_map Metric analysis
 /// @param live_register_map Currently used (or live) register count denoting register pressure
-json merge_analysis_register_spill(std::unordered_map<std::string, std::vector<local_memory_counter>> spilling_analysis_map, std::unordered_map<std::string, std::vector<track_register_instruction>> track_register_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map, std::unordered_map<std::string, std::vector<live_registers>> live_register_map, int total_SM)
+json merge_analysis_register_spill(std::unordered_map<std::string, std::vector<local_memory_counter>> spilling_analysis_map, std::unordered_map<std::string, std::vector<track_register_instruction>> track_register_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map, std::unordered_map<std::string, std::vector<live_registers>> live_register_map, int total_SM, const std::vector<std::string> &kernel_patterns)
 {
     json result;
 
     for (auto [k_sass, v_sass] : spilling_analysis_map)
     {
+        if (!gpuscout_kernel_allowed(k_sass, kernel_patterns))
+        {
+            continue;
+        }
+
         json kernel_result = {
             {"occurrences", json::array()}
         };
@@ -106,17 +112,15 @@ json merge_analysis_register_spill(std::unordered_map<std::string, std::vector<l
             spilled_detected_flag = true;
 
             // Map kernel with the PC Stall map
-            for (auto [k_pc, v_pc] : pc_stall_map)
+            auto pc_it = pc_stall_map.find(k_sass);
+            if (pc_it != pc_stall_map.end())
             {
-                if ((k_pc == k_sass)) // analyze for the same kernel (sass analysis and pc sampling analysis)
+                for (const auto &j : pc_it->second)
                 {
-                    for (const auto &j : v_pc)
+                    if (index_sass.line_number == j.line_number)
                     {
-                        if (index_sass.line_number == j.line_number) // analyze for the same line numbers in the code
-                        {
-                            print_stalls_percentage(j);
-                            break;
-                        }
+                        print_stalls_percentage(j);
+                        break;
                     }
                 }
             }
@@ -130,24 +134,25 @@ json merge_analysis_register_spill(std::unordered_map<std::string, std::vector<l
         }
 
         // Map kernel with metrics collected
-        for (auto [k_metric, v_metric] : metric_map)
+        auto m_it = metric_map.find(k_sass);
+        if (m_it != metric_map.end())
         {
-            if ((k_metric == k_sass)) // analyze for the same kernel (sass analysis and metric analysis)
-            {
-                std::cout << "INFO  ::  Data flow in memory for load operations" << std::endl;
-                load_data_memory_flow(metric_map[k_metric]); // show the memory flow (to check local memory flow)
+            const auto &v_metric = m_it->second;
+            std::cout << "INFO  ::  Data flow in memory for load operations" << std::endl;
+            load_data_memory_flow(metric_map[k_sass]);
 
-                // copied register_spilling_analysis from stalls_static_analysis_relation() method
-                std::cout << "For register spilling, check Long Scoreboard stalls: " << v_metric.metrics_list.smsp__warp_issue_stalled_long_scoreboard_per_warp_active << " % per warp active" << std::endl;
-                std::cout << "For register spilling, check LG Throttle stalls: " << v_metric.metrics_list.smsp__warp_issue_stalled_lg_throttle_per_warp_active << " % per warp active" << std::endl;
-                auto local_load_store = v_metric.metrics_list.smsp__inst_executed_op_local_ld + v_metric.metrics_list.smsp__inst_executed_op_local_st;
-                auto estimated_l2_queries_lmem_allSM = 2 * 4 * total_SM * ((1 - (v_metric.metrics_list.l1tex__t_sector_hit_rate / 100)) * local_load_store);
-                auto total_l2_queries = v_metric.metrics_list.lts__t_sectors_op_read + v_metric.metrics_list.lts__t_sectors_op_write + v_metric.metrics_list.lts__t_sectors_op_atom + v_metric.metrics_list.lts__t_sectors_op_red;
+            std::cout << "For register spilling, check Long Scoreboard stalls: " << v_metric.metrics_list.smsp__warp_issue_stalled_long_scoreboard_per_warp_active << " % per warp active" << std::endl;
+            std::cout << "For register spilling, check LG Throttle stalls: " << v_metric.metrics_list.smsp__warp_issue_stalled_lg_throttle_per_warp_active << " % per warp active" << std::endl;
+            auto local_load_store = v_metric.metrics_list.smsp__inst_executed_op_local_ld + v_metric.metrics_list.smsp__inst_executed_op_local_st;
+            auto estimated_l2_queries_lmem_allSM = 2 * 4 * total_SM * ((1 - (v_metric.metrics_list.l1tex__t_sector_hit_rate / 100)) * local_load_store);
+            auto total_l2_queries = v_metric.metrics_list.lts__t_sectors_op_read + v_metric.metrics_list.lts__t_sectors_op_write + v_metric.metrics_list.lts__t_sectors_op_atom + v_metric.metrics_list.lts__t_sectors_op_red;
+            if (total_l2_queries != 0)
+            {
                 auto l2_queries_lmem_percent = estimated_l2_queries_lmem_allSM / total_l2_queries;
                 std::cout << estimated_l2_queries_lmem_allSM << " - " << total_l2_queries << std::endl;
                 std::cout << "Percentage of total L2 queries due to LMEM: " << l2_queries_lmem_percent << " %" << std::endl;
                 std::cout << "WARNING   ::  If the above percentage is high, it means the memory traffic between the SMs and L2 cache is mostly due to LMEM (need to contain register spills)" << std::endl;
-            };
+            }
         }
 
         result[k_sass] = kernel_result;
@@ -177,7 +182,13 @@ int main(int argc, char **argv)
     std::string json_output_dir = argv[8];
     int sm_count = std::stoi(argv[9]);
 
-    json result = merge_analysis_register_spill(spilling_analysis_map, track_register_map, pc_stall_map, metric_map, live_register_map, sm_count);
+    std::vector<std::string> kernel_patterns;
+    if (argc >= 11)
+    {
+        kernel_patterns = gpuscout_parse_comma_list(argv[10]);
+    }
+
+    json result = merge_analysis_register_spill(spilling_analysis_map, track_register_map, pc_stall_map, metric_map, live_register_map, sm_count, kernel_patterns);
 
     if (save_as_json)
     {

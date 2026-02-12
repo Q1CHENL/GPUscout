@@ -10,6 +10,7 @@
 #include "parser_sass_use_shared.hpp"
 #include "parser_pcsampling.hpp"
 #include "parser_metrics.hpp"
+#include "kernel_filter.hpp"
 #include "utilities/json.hpp"
 
 using json = nlohmann::json;
@@ -55,12 +56,17 @@ void print_stalls_percentage(const pc_issue_samples &index)
 /// @param branch_map Target branch information to detect if the atomic operation is in a for-loop
 /// @param pc_stall_map CUPTI warp stalls
 /// @param metric_map Metric analysis
-json merge_analysis_use_shared(std::unordered_map<std::string, std::vector<register_access>> shared_analysis_map, std::unordered_map<std::string, std::vector<branch_counter>> branch_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map)
+json merge_analysis_use_shared(std::unordered_map<std::string, std::vector<register_access>> shared_analysis_map, std::unordered_map<std::string, std::vector<branch_counter>> branch_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map, const std::vector<std::string> &kernel_patterns)
 {
     json result;
 
     for (auto [k_sass, v_sass] : shared_analysis_map)
     {
+        if (!gpuscout_kernel_allowed(k_sass, kernel_patterns))
+        {
+            continue;
+        }
+
         json kernel_result = {
             {"occurrences", {}}
         };
@@ -142,17 +148,15 @@ json merge_analysis_use_shared(std::unordered_map<std::string, std::vector<regis
                                 std::cout << "This register seems to be in a for loop and hence will perform multiple load operations" << std::endl;
 
                                 // // Map kernel with the PC Stall map
-                                for (auto [k_pc, v_pc] : pc_stall_map)
+                                auto pc_it = pc_stall_map.find(k_sass);
+                                if (pc_it != pc_stall_map.end())
                                 {
-                                    if ((k_pc == k_sass)) // analyze for the same kernel (sass analysis and pc sampling analysis)
+                                    for (const auto &j_pc : pc_it->second)
                                     {
-                                        for (const auto &j_pc : v_pc)
+                                        if ((index_sass.line_number == j_pc.line_number) && (get_register_from_line(j_pc.sass_instruction) == index_sass.register_number))
                                         {
-                                            if ((index_sass.line_number == j_pc.line_number) && (get_register_from_line(j_pc.sass_instruction) == index_sass.register_number))
-                                            {
-                                                print_stalls_percentage(j_pc);
-                                                break;
-                                            }
+                                            print_stalls_percentage(j_pc);
+                                            break;
                                         }
                                     }
                                 }
@@ -175,21 +179,18 @@ json merge_analysis_use_shared(std::unordered_map<std::string, std::vector<regis
         }
 
         // Map kernel with metrics collected
-        for (auto [k_metric, v_metric] : metric_map)
+        auto m_it = metric_map.find(k_sass);
+        if (m_it != metric_map.end())
         {
-            if ((k_metric == k_sass)) // analyze for the same kernel (sass analysis and metric analysis)
-            {
-                std::cout << "INFO  ::  Check data flow in shared memory, if you modify your code to use shared memory" << std::endl;
-                shared_data_memory_flow(metric_map[k_metric]); // show the memory flow (to check shared memory flow)
+            const auto &v_metric = m_it->second;
+            std::cout << "INFO  ::  Check data flow in shared memory, if you modify your code to use shared memory" << std::endl;
+            shared_data_memory_flow(metric_map[k_sass]);
 
-                // copied use_shared_memory_analysis from stalls_static_analysis_relation() method
-                std::cout << "If using shared memory, check Long Scoreboard: " << v_metric.metrics_list.smsp__warp_issue_stalled_long_scoreboard_per_warp_active << " %" << std::endl;
-                std::cout << "If using shared memory, check MIO throttle: " << v_metric.metrics_list.smsp__warp_issue_stalled_mio_throttle_per_warp_active << " %" << std::endl;
+            std::cout << "If using shared memory, check Long Scoreboard: " << v_metric.metrics_list.smsp__warp_issue_stalled_long_scoreboard_per_warp_active << " %" << std::endl;
+            std::cout << "If using shared memory, check MIO throttle: " << v_metric.metrics_list.smsp__warp_issue_stalled_mio_throttle_per_warp_active << " %" << std::endl;
 
-                //  If multiple threads in the same warp request access to the same memory bank, the accesses are serialized
-                std::cout << "INFO  ::  Check bank conflict in shared memory, if you modify your code to use shared memory." << std::endl;
-                shared_memory_bank_conflict(metric_map[k_metric]); // show how many way bank conflict present in the shared memory access
-            }
+            std::cout << "INFO  ::  Check bank conflict in shared memory, if you modify your code to use shared memory." << std::endl;
+            shared_memory_bank_conflict(metric_map[k_sass]);
         }
 
         result[k_sass] = kernel_result;
@@ -214,7 +215,13 @@ int main(int argc, char **argv)
     int save_as_json = std::strcmp(argv[6], "true") == 0;
     std::string json_output_dir = argv[7];
 
-    json result = merge_analysis_use_shared(shared_analysis_map, branch_map, pc_stall_map, metric_map);
+    std::vector<std::string> kernel_patterns;
+    if (argc >= 9)
+    {
+        kernel_patterns = gpuscout_parse_comma_list(argv[8]);
+    }
+
+    json result = merge_analysis_use_shared(shared_analysis_map, branch_map, pc_stall_map, metric_map, kernel_patterns);
 
     if (save_as_json)
     {

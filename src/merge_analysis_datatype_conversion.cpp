@@ -10,6 +10,7 @@
 #include "parser_sass_datatype_conversion.hpp"
 #include "parser_pcsampling.hpp"
 #include "parser_metrics.hpp"
+#include "kernel_filter.hpp"
 #include "utilities/json.hpp"
 #include <cstring>
 #include <fstream>
@@ -41,12 +42,17 @@ void print_stalls_percentage(const pc_issue_samples &index)
 /// @param datatype_conversion_map Includes I2F, F2I and F2F conversion data
 /// @param pc_stall_map CUPTI warp stalls
 /// @param metric_map Metric analysis
-json merge_analysis_datatype_conversion(std::unordered_map<std::string, datatype_conversions_counter> datatype_conversion_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map)
+json merge_analysis_datatype_conversion(std::unordered_map<std::string, datatype_conversions_counter> datatype_conversion_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map, const std::vector<std::string> &kernel_patterns)
 {
     json result;
 
     for (auto [k_sass, v_sass] : datatype_conversion_map)
     {
+        if (!gpuscout_kernel_allowed(k_sass, kernel_patterns))
+        {
+            continue;
+        }
+
         json kernel_result = {
             {"occurrences", json::array()}
         };
@@ -118,15 +124,13 @@ json merge_analysis_datatype_conversion(std::unordered_map<std::string, datatype
             std::cout << "INFO  ::  No F2I conversions found" << std::endl;
         }
 
-        for (auto [k_metric, v_metric] : metric_map)
+        auto m_it = metric_map.find(k_sass);
+        if (m_it != metric_map.end())
         {
-            if ((k_metric == k_sass)) // analyze for the same kernel (sass analysis and metric analysis)
-            {
-                // copied datatype_conversions from stalls_static_analysis_relation() method
-                std::cout << "For F2F (32 to 64 bit) conversions, check Tex throttle: " << v_metric.metrics_list.smsp__warp_issue_stalled_tex_throttle_per_warp_active << " %" << std::endl;
-                std::cout << "For I2F and F2F (32 bit only) conversions, check MIO throttle: " << v_metric.metrics_list.smsp__warp_issue_stalled_mio_throttle_per_warp_active << " %" << std::endl;
-                std::cout << "For I2F and F2F (32 bit only) conversions, check Short Scoreboard: " << v_metric.metrics_list.smsp__warp_issue_stalled_short_scoreboard_per_warp_active << " %" << std::endl;
-            }
+            const auto &v_metric = m_it->second;
+            std::cout << "For F2F (32 to 64 bit) conversions, check Tex throttle: " << v_metric.metrics_list.smsp__warp_issue_stalled_tex_throttle_per_warp_active << " %" << std::endl;
+            std::cout << "For I2F and F2F (32 bit only) conversions, check MIO throttle: " << v_metric.metrics_list.smsp__warp_issue_stalled_mio_throttle_per_warp_active << " %" << std::endl;
+            std::cout << "For I2F and F2F (32 bit only) conversions, check Short Scoreboard: " << v_metric.metrics_list.smsp__warp_issue_stalled_short_scoreboard_per_warp_active << " %" << std::endl;
         }
 
         result[k_sass] = kernel_result;
@@ -149,7 +153,13 @@ int main(int argc, char **argv)
     int save_as_json = std::strcmp(argv[6], "true") == 0;
     std::string json_output_dir = argv[7];
 
-    json result = merge_analysis_datatype_conversion(datatype_conversion_map, pc_stall_map, metric_map);
+    std::vector<std::string> kernel_patterns;
+    if (argc >= 9)
+    {
+        kernel_patterns = gpuscout_parse_comma_list(argv[8]);
+    }
+
+    json result = merge_analysis_datatype_conversion(datatype_conversion_map, pc_stall_map, metric_map, kernel_patterns);
 
     if (save_as_json)
     {

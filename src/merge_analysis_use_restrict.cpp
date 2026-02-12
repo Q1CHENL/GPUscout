@@ -11,6 +11,7 @@
 #include "parser_pcsampling.hpp"
 #include "parser_metrics.hpp"
 #include "parser_liveregisters.hpp"
+#include "kernel_filter.hpp"
 #include "utilities/json.hpp"
 #include <cstddef>
 
@@ -57,12 +58,17 @@ void print_stalls_percentage(const pc_issue_samples &index)
 /// @param pc_stall_map CUPTI warp stalls
 /// @param metric_map Metric analysis
 /// @param live_register_map Currently used (or live) register count denoting register pressure
-json merge_analysis_restrict(std::unordered_map<std::string, std::vector<register_used>> restrict_analysis_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map, std::unordered_map<std::string, std::vector<live_registers>> live_register_map)
+json merge_analysis_restrict(std::unordered_map<std::string, std::vector<register_used>> restrict_analysis_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map, std::unordered_map<std::string, std::vector<live_registers>> live_register_map, const std::vector<std::string> &kernel_patterns)
 {
     json result;
 
     for (auto [k_sass, v_sass] : restrict_analysis_map)
     {
+        if (!gpuscout_kernel_allowed(k_sass, kernel_patterns))
+        {
+            continue;
+        }
+
         json kernel_result = {
             {"occurrences", json::array()}
         };
@@ -99,21 +105,22 @@ json merge_analysis_restrict(std::unordered_map<std::string, std::vector<registe
                 };
 
                 // Map kernel with the PC Stall map
-                for (auto [k_pc, v_pc] : pc_stall_map)
+                auto pc_it = pc_stall_map.find(k_sass);
+                if (pc_it != pc_stall_map.end())
                 {
-                    if ((k_pc == k_sass)) // analyze for the same kernel (sass analysis and pc sampling analysis)
+                    for (const auto &j : pc_it->second)
                     {
-                        for (const auto &j : v_pc)
+                        if ((index_sass.line_number == j.line_number) && (get_register_from_line(j.sass_instruction) == index_sass.register_number))
                         {
-                            if ((index_sass.line_number == j.line_number) && (get_register_from_line(j.sass_instruction) == index_sass.register_number)) // analyze for the same line numbers in the code and same registers in SASS
+                            // Print the number of current number of active registers
+                            auto lr_it = live_register_map.find(k_sass);
+                            if (lr_it != live_register_map.end())
                             {
-                                // Print the number of current number of active registers
-                                int pcOffset_to_search = j.pc_offset; // convert dec to hex
-                                std::vector<live_registers>::iterator reg_search_it = std::find_if(live_register_map[k_sass].begin(), live_register_map[k_sass].end(), [&](const live_registers &register_index)
-                                                                                                   { return pcOffset_to_search == std::stoul(register_index.pcOffset, nullptr, 16); });
-                                if (reg_search_it != live_register_map[k_sass].end())
+                                int pcOffset_to_search = j.pc_offset;
+                                auto reg_search_it = std::find_if(lr_it->second.begin(), lr_it->second.end(), [&](const live_registers &register_index)
+                                                                  { return pcOffset_to_search == std::stoul(register_index.pcOffset, nullptr, 16); });
+                                if (reg_search_it != lr_it->second.end())
                                 {
-                                    // std::cout << reg_search_it->gen_reg << ", " << reg_search_it->pred_reg << " ," << reg_search_it->u_gen_reg << std::endl;
                                     std::cout << "INFO  ::  Total current registers for the SASS instruction: " << reg_search_it->gen_reg + reg_search_it->pred_reg + reg_search_it->u_gen_reg << std::endl;
                                     line_result["used_register_count"] = reg_search_it->gen_reg + reg_search_it->pred_reg + reg_search_it->u_gen_reg;
                                     if (reg_search_it->change_reg_from_last > 0)
@@ -122,13 +129,13 @@ json merge_analysis_restrict(std::unordered_map<std::string, std::vector<registe
                                         line_result["register_pressure_increase"] = std::abs(reg_search_it->change_reg_from_last);
                                     }
                                 }
-
-                                if (!index_sass.read_only_mem_used)
-                                {
-                                    print_stalls_percentage(j);
-                                }
-                                break; // once register matched/found, get out of the loop
                             }
+
+                            if (!index_sass.read_only_mem_used)
+                            {
+                                print_stalls_percentage(j);
+                            }
+                            break;
                         }
                     }
                 }
@@ -144,12 +151,10 @@ json merge_analysis_restrict(std::unordered_map<std::string, std::vector<registe
         }
 
         // Map kernel with metrics collected
-        for (auto [k_metric, v_metric] : metric_map)
+        auto m_it = metric_map.find(k_sass);
+        if (m_it != metric_map.end())
         {
-            if ((k_metric == k_sass)) // analyze for the same kernel (sass analysis and metric analysis)
-            {
-                std::cout << "If using __restrict__ (read-only cache), check IMC miss: " << v_metric.metrics_list.smsp__warp_issue_stalled_imc_miss_per_warp_active << " % per warp active" << std::endl;
-            }
+            std::cout << "If using __restrict__ (read-only cache), check IMC miss: " << m_it->second.metrics_list.smsp__warp_issue_stalled_imc_miss_per_warp_active << " % per warp active" << std::endl;
         }
 
         result[k_sass] = kernel_result;
@@ -175,7 +180,13 @@ int main(int argc, char **argv)
     int save_as_json = std::strcmp(argv[7], "true") == 0;
     std::string json_output_dir = argv[8];
 
-    json result = merge_analysis_restrict(restrict_analysis_map, pc_stall_map, metric_map, live_register_map);
+    std::vector<std::string> kernel_patterns;
+    if (argc >= 10)
+    {
+        kernel_patterns = gpuscout_parse_comma_list(argv[9]);
+    }
+
+    json result = merge_analysis_restrict(restrict_analysis_map, pc_stall_map, metric_map, live_register_map, kernel_patterns);
 
     if (save_as_json)
     {
