@@ -14,6 +14,7 @@ include_directories(CUDA::cupti)
 #link_libraries(CUDA::toolkit)
 
 install(PROGRAMS GPUscout.sh DESTINATION . RENAME GPUscout)
+install(PROGRAMS nsys_report_to_hotspot_kernels.py DESTINATION .)
 
 add_subdirectory(src)
 

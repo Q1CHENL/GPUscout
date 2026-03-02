@@ -163,10 +163,81 @@ extract_kernels_from_generated_sass () {
     fi
 }
 
+# Extract a readable kernel base name from a mangled symbol.
+# Example: _ZN5cuZFP11cudaDecode1IxEEv... -> cudaDecode1
+extract_kernel_base_name_from_symbol () {
+    local symbol="$1"
+    local rest component_len component base_name=""
+    local fallback="${symbol}"
+
+    fallback="${fallback%%(*}"
+    fallback="${fallback##*::}"
+    fallback="${fallback%%<*}"
+    fallback="$(trim_whitespace "${fallback}")"
+
+    if [[ "${symbol}" == _ZN* ]]; then
+        rest="${symbol#_ZN}"
+    elif [[ "${symbol}" == _Z* ]]; then
+        rest="${symbol#_Z}"
+    else
+        if [ -n "${fallback}" ]; then
+            printf '%s' "${fallback}"
+        else
+            printf '%s' "${symbol}"
+        fi
+        return
+    fi
+
+    while [[ "${rest}" =~ ^([0-9]+) ]]; do
+        component_len="${BASH_REMATCH[1]}"
+        rest="${rest#${component_len}}"
+
+        if [ "${#rest}" -lt "${component_len}" ]; then
+            break
+        fi
+
+        component="${rest:0:${component_len}}"
+        rest="${rest:${component_len}}"
+        base_name="${component}"
+    done
+
+    if [ -n "${base_name}" ]; then
+        printf '%s' "${base_name}"
+    elif [ -n "${fallback}" ]; then
+        printf '%s' "${fallback}"
+    else
+        printf '%s' "${symbol}"
+    fi
+}
+
+# Build de-duplicated NCU kernel patterns for auto mode from mangled symbols.
+build_auto_ncu_kernel_patterns () {
+    local kernel base_name
+
+    auto_ncu_kernel_patterns=()
+
+    for kernel in "${top_kernels[@]}"; do
+        base_name="$(extract_kernel_base_name_from_symbol "${kernel}")"
+        base_name="$(trim_whitespace "${base_name}")"
+        if [ -z "${base_name}" ]; then
+            continue
+        fi
+        if ! array_contains "${base_name}" "${auto_ncu_kernel_patterns[@]}"; then
+            auto_ncu_kernel_patterns+=("${base_name}")
+        fi
+    done
+
+    if [ "${#auto_ncu_kernel_patterns[@]}" -eq 0 ]; then
+        auto_ncu_kernel_patterns=("${top_kernels[@]}")
+    fi
+}
+
 kernels_selection_mode="user"
 if [ -z "${kernels_arg:-}" ]; then
     extract_kernels_from_generated_sass "${gpuscout_tmp_dir}/nvdisasm-executable-${run_prefix}-sass.txt"
     top_kernels=("${extracted_cubin_kernels[@]}")
+    build_auto_ncu_kernel_patterns
+    top_kernels=("${auto_ncu_kernel_patterns[@]}")
     kernels_selection_mode="auto_from_generated_sass"
 else
     parse_csv_list "${kernels_arg}" "kernels"
@@ -193,7 +264,10 @@ if [ "${#invalid_analyses[@]}" -gt 0 ]; then
     exit 1
 fi
 
-echo "Selected kernels for NCU collection: $(join_by_comma "${top_kernels[@]}")"
+ncu_collection_kernels=("${top_kernels[@]}")
+ncu_kernel_base_args=(--kernel-name-base demangled)
+
+echo "Selected kernels for NCU collection: $(join_by_comma "${ncu_collection_kernels[@]}")"
 echo "Selected analyses: $(join_by_comma "${enabled_analyses[@]}")"
 echo "Kernel selection mode: ${kernels_selection_mode}"
 
@@ -380,14 +454,10 @@ if [ "$dry_run" = false ]; then
         metrics_out="${run_prefix}_metrics_list"
 
         echo "NCU mode: one launch per selected kernel (skip=5)"
-        ncu_kernel_base_args=()
-        if [ "${kernels_selection_mode}" = "auto_from_generated_sass" ]; then
-            ncu_kernel_base_args=(--kernel-name-base mangled)
-        fi
 
         rm -f "${metrics_out}"
 
-        for kernel in "${top_kernels[@]}"; do
+        for kernel in "${ncu_collection_kernels[@]}"; do
             echo "Profiling NCU metrics for kernel pattern: ${kernel}"
             tmp_csv="$(mktemp)"
 
@@ -401,8 +471,9 @@ if [ "$dry_run" = false ]; then
         done
 
         if [ ! -f "${metrics_out}" ]; then
-            echo "ERROR: NCU did not produce any CSV rows for the selected kernels."
-            exit 1
+            echo "WARNING: NCU did not produce any CSV rows for the selected kernels. Continuing without NCU metrics."
+            # Emit a minimal valid CSV header so downstream parsers can proceed cleanly.
+            printf '"ID","Process ID","Process Name","Host Name","Kernel Name","Kernel Time","Context","Stream","Section Name","Metric Name","Metric Unit","Metric Value"\n' > "${metrics_out}"
         fi
 
         mv "${metrics_out}" "${gpuscout_tmp_dir}/${metrics_out}"

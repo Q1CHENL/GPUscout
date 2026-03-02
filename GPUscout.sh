@@ -2,7 +2,7 @@
 
 # Define the usage function
 usage() {
-    echo "Usage: $0 [-h] [--dry-run] [--verbose] -e executable [-c directory] [--args] [--kernels list] [--analysis list]"
+    echo "Usage: $0 [-h] [--dry_run] [--verbose] -e executable [-c directory] [--args] [--kernels list] [--analysis list] [--nsys-hotspot-kernels [num]]"
     echo "  -h | --help : Display this help."
     echo "  --dry_run : performs only dry_run. A --dry_run will only analyse the SASS instructions. --dry_run will neither read warp stalls nor Nsight metrics "
     echo "  -v | --verbose : print more verbose output. "
@@ -15,11 +15,49 @@ usage() {
     echo "              If omitted, kernels are auto-discovered from generated SASS (cubin-scoped)."
     echo "  --analysis : Comma-separated analyses to run. e.g. --analysis=\"warp_divergence,use_shared\""
     echo "              If omitted, all analyses are enabled."
+    echo "  --nsys-hotspot-kernels [num] : Run Nsight Systems, parse hotspot kernels, and use top kernels for profiling."
+    echo "                                 Default num is 10 when not specified. Cannot be used with --kernels."
     exit 1
 }
 
+raw_args=("$@")
+normalized_args=()
+pre_nsys_hotspot_kernels_count=""
+i=0
+while [ "${i}" -lt "${#raw_args[@]}" ]; do
+    arg="${raw_args[$i]}"
+    case "${arg}" in
+        --)
+            normalized_args+=("${arg}")
+            i=$((i + 1))
+            while [ "${i}" -lt "${#raw_args[@]}" ]; do
+                normalized_args+=("${raw_args[$i]}")
+                i=$((i + 1))
+            done
+            ;;
+        --nsys-hotspot-kernels)
+            next_idx=$((i + 1))
+            next_arg=""
+            if [ "${next_idx}" -lt "${#raw_args[@]}" ]; then
+                next_arg="${raw_args[$next_idx]}"
+            fi
+            if [ -n "${next_arg}" ] && [[ "${next_arg}" != -* ]]; then
+                pre_nsys_hotspot_kernels_count="${next_arg}"
+                i=$((i + 2))
+            else
+                pre_nsys_hotspot_kernels_count="10"
+                i=$((i + 1))
+            fi
+            ;;
+        *)
+            normalized_args+=("${arg}")
+            i=$((i + 1))
+            ;;
+    esac
+done
+
 # Parse command-line options
-options=$(getopt -o hve:c:a:j -l help,dry_run,verbose,executable:,cubin:,args:,sm_count:,json,kernels:,analysis: -- "$@")
+options=$(getopt -o hve:c:a:j -l help,dry_run,verbose,executable:,cubin:,args:,sm_count:,json,kernels:,analysis: -- "${normalized_args[@]}")
 
 if [ $? -ne 0 ]; then
     echo "Error: Invalid option."
@@ -37,6 +75,7 @@ args=""
 sms=16
 kernels_arg=""
 analysis_arg=""
+nsys_hotspot_kernels_count="${pre_nsys_hotspot_kernels_count}"
 while true; do
     case "$1" in
         -h | --help)
@@ -161,12 +200,152 @@ validate_analysis_values() {
     fi
 }
 
+is_positive_integer() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+extract_top_kernel_names_from_csv() {
+    local csv_file="$1"
+    local top_n="$2"
+
+    python3 - "${csv_file}" "${top_n}" <<'PY'
+import csv
+import sys
+
+csv_file = sys.argv[1]
+top_n = int(sys.argv[2])
+
+with open(csv_file, "r", newline="", encoding="utf-8-sig") as handle:
+    reader = csv.reader(handle)
+    header = next(reader, None)
+    if not header:
+        raise SystemExit(1)
+    stripped = [h.strip() for h in header]
+    if "Name" not in stripped:
+        raise SystemExit(2)
+    name_idx = stripped.index("Name")
+    emitted = 0
+    for row in reader:
+        if len(row) <= name_idx:
+            continue
+        name = row[name_idx].strip()
+        if not name:
+            continue
+        print(name)
+        emitted += 1
+        if emitted >= top_n:
+            break
+    if emitted == 0:
+        raise SystemExit(3)
+PY
+}
+
+discover_nsys_hotspot_kernels() {
+    local top_n="$1"
+    local profile_prefix="${gpuscout_tmp_dir}/nsys-profile-${run_prefix}"
+    local stats_prefix="${gpuscout_tmp_dir}/nsys-stats-${run_prefix}"
+    local rep_file=""
+    local stats_csv=""
+    local collapsed_csv=""
+    local parser_script="${gpuscout_dir}/nsys_report_to_hotspot_kernels.py"
+    local hotspot_names=""
+    local kernel
+    local hotspot_kernels=()
+
+    if ! command -v nsys >/dev/null 2>&1; then
+        echo "ERROR: --nsys-hotspot-kernels requires 'nsys' in PATH."
+        exit 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "ERROR: --nsys-hotspot-kernels requires 'python3' in PATH."
+        exit 1
+    fi
+    if [ ! -f "${parser_script}" ]; then
+        echo "ERROR: Parser script not found: ${parser_script}"
+        exit 1
+    fi
+
+    rm -f "${profile_prefix}".nsys-rep "${profile_prefix}".qdrep "${profile_prefix}".sqlite
+    rm -f "${stats_prefix}"*.csv
+
+    echo "Running Nsight Systems to auto-detect hotspot kernels (top ${top_n}) . . ."
+    local start_nsys_profile end_nsys_profile nsys_profile_time
+    start_nsys_profile="$(python3 -c 'import time; print(time.time())')"
+    nsys profile --trace cuda --force-overwrite true --output "${profile_prefix}" ${executable} ${args}
+    end_nsys_profile="$(python3 -c 'import time; print(time.time())')"
+    nsys_profile_time=$(awk "BEGIN {print ${end_nsys_profile} - ${start_nsys_profile}}")
+    echo "Nsight Systems profile time: ${nsys_profile_time}s"
+
+    if [ -f "${profile_prefix}.nsys-rep" ]; then
+        rep_file="${profile_prefix}.nsys-rep"
+    elif [ -f "${profile_prefix}.qdrep" ]; then
+        rep_file="${profile_prefix}.qdrep"
+    else
+        echo "ERROR: Nsight Systems did not produce a report file."
+        exit 1
+    fi
+
+    local start_nsys_stats end_nsys_stats nsys_stats_time
+    start_nsys_stats="$(python3 -c 'import time; print(time.time())')"
+    if ! nsys stats --report cuda_gpu_kern_sum --output "${stats_prefix}" --format csv "${rep_file}"; then
+        echo "ERROR: Failed to generate Nsight Systems kernel CSV report (cuda_gpu_kern_sum)."
+        exit 1
+    fi
+    end_nsys_stats="$(python3 -c 'import time; print(time.time())')"
+    nsys_stats_time=$(awk "BEGIN {print ${end_nsys_stats} - ${start_nsys_stats}}")
+    echo "Nsight Systems stats time: ${nsys_stats_time}s"
+
+    stats_csv="$(find "${gpuscout_tmp_dir}" -maxdepth 1 -type f -name "$(basename "${stats_prefix}")*.csv" | head -n 1)"
+    if [ -z "${stats_csv}" ] || [ ! -f "${stats_csv}" ]; then
+        echo "ERROR: Nsight Systems CSV report not found under ${gpuscout_tmp_dir}"
+        exit 1
+    fi
+
+    collapsed_csv="$(python3 "${parser_script}" "${stats_csv}" | tail -n 1)"
+    if [ -z "${collapsed_csv}" ] || [ ! -f "${collapsed_csv}" ]; then
+        echo "ERROR: Failed to build collapsed hotspot CSV with ${parser_script}"
+        exit 1
+    fi
+
+    hotspot_names="$(extract_top_kernel_names_from_csv "${collapsed_csv}" "${top_n}")"
+    if [ -z "${hotspot_names}" ]; then
+        echo "ERROR: No hotspot kernels found in ${collapsed_csv}"
+        exit 1
+    fi
+
+    while IFS= read -r kernel; do
+        kernel="$(trim_whitespace "${kernel}")"
+        if [ -n "${kernel}" ]; then
+            hotspot_kernels+=("${kernel}")
+        fi
+    done <<< "${hotspot_names}"
+
+    if [ "${#hotspot_kernels[@]}" -eq 0 ]; then
+        echo "ERROR: No valid hotspot kernel names extracted from ${collapsed_csv}"
+        exit 1
+    fi
+
+    local IFS=,
+    kernels_arg="${hotspot_kernels[*]}"
+    echo "Nsight hotspot kernels selected: ${kernels_arg}"
+}
+
 if [ -n "${kernels_arg}" ]; then
     validate_csv_list_syntax "${kernels_arg}" "kernels"
 fi
 if [ -n "${analysis_arg}" ]; then
     validate_csv_list_syntax "${analysis_arg}" "analysis"
     validate_analysis_values "${analysis_arg}"
+fi
+if [ -n "${nsys_hotspot_kernels_count}" ]; then
+    if ! is_positive_integer "${nsys_hotspot_kernels_count}"; then
+        echo "ERROR: --nsys-hotspot-kernels expects a positive integer, got: ${nsys_hotspot_kernels_count}"
+        exit 1
+    fi
+fi
+if [ -n "${kernels_arg}" ] && [ -n "${nsys_hotspot_kernels_count}" ]; then
+    echo "ERROR: --kernels cannot be used together with --nsys-hotspot-kernels."
+    exit 1
 fi
 
 #check the params
@@ -209,6 +388,10 @@ if [ "$json" = true ]; then
     mkdir -p ${gpuscout_output_dir}
 fi
 
+if [ -n "${nsys_hotspot_kernels_count}" ]; then
+    discover_nsys_hotspot_kernels "${nsys_hotspot_kernels_count}"
+fi
+
 # Note: when you compile the code with nvcc, create 2 executables
 # 1. without -cubin flag: <executable name>
 # 2. with -cubin flag: prefix the name of the executable with cubin-<executable name>
@@ -221,6 +404,7 @@ echo "==== Verbose: $verbose"
 echo "==== JSON Output: $json"
 echo "==== Kernels Filter: ${kernels_arg:-<not set: auto-select kernels from generated SASS (cubin-scoped)>}"
 echo "==== Analyses: ${analysis_arg:-<not set: all analyses>}"
+echo "==== Nsight Hotspot Kernels: ${nsys_hotspot_kernels_count:-<disabled>}"
 echo "======================================================================================================"
 
 
@@ -253,6 +437,7 @@ rm merge_analysis_warp_divergence 2>/dev/null
 rm merge_analysis_use_texture 2>/dev/null
 rm merge_analysis_use_shared 2>/dev/null
 rm merge_analysis_datatype_conversion 2>/dev/null
+rm merge_analysis_deadlock_detection 2>/dev/null
 
 echo "Setting up profiling . . . . . . . . . . . . . . . "
 # Remove and Create build directory
