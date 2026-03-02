@@ -11,6 +11,7 @@
 #include "parser_pcsampling.hpp"
 #include "parser_metrics.hpp"
 #include "parser_liveregisters.hpp"
+#include "kernel_filter.hpp"
 #include "utilities/json.hpp"
 
 using json = nlohmann::json;
@@ -42,7 +43,7 @@ void print_stalls_percentage(const pc_issue_samples &index)
 /// @param pc_stall_map CUPTI warp stalls
 /// @param metric_map Metric analysis
 /// @param live_register_map Currently used (or live) register count denoting register pressure
-json merge_analysis_vectorize(std::unordered_map<std::string, load_counter> vectorize_analysis_map, std::unordered_map<std::string, std::vector<register_data>> register_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map, std::unordered_map<std::string, std::vector<live_registers>> live_register_map)
+json merge_analysis_vectorize(std::unordered_map<std::string, load_counter> vectorize_analysis_map, std::unordered_map<std::string, std::vector<register_data>> register_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map, std::unordered_map<std::string, std::vector<live_registers>> live_register_map, const std::vector<std::string> &kernel_filters)
 {
     json result;
 
@@ -57,6 +58,10 @@ json merge_analysis_vectorize(std::unordered_map<std::string, load_counter> vect
         if (k_sass == "")
         {
             break;
+        }
+        if (!kernel_matches_filter(k_sass, kernel_filters))
+        {
+            continue;
         }
 
         std::cout << "--------------------- Vectorized load analysis for kernel: " << k_sass << "   --------------------- " << std::endl;
@@ -191,8 +196,13 @@ int main(int argc, char **argv)
 
     int save_as_json = std::strcmp(argv[7], "true") == 0;
     std::string json_output_dir = argv[8];
+    std::vector<std::string> kernel_filters;
+    if (argc > 9)
+    {
+        kernel_filters = parse_kernel_filter_csv(argv[9]);
+    }
 
-    json result = merge_analysis_vectorize(vectorize_analysis_map, register_map, pc_stall_map, metric_map, live_register_map);
+    json result = merge_analysis_vectorize(vectorize_analysis_map, register_map, pc_stall_map, metric_map, live_register_map, kernel_filters);
 
     if (save_as_json)
     {

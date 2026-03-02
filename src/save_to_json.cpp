@@ -1,5 +1,6 @@
 #include "parser_metrics.hpp"
 #include "parser_pcsampling.hpp"
+#include "kernel_filter.hpp"
 #include "utilities/json.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -46,6 +47,11 @@ int main(int argc, char **argv)
     std::string pc_samples_file = argv[6];
     std::string metrics_file = argv[7];
     int sm_count = std::stoi(argv[8]);
+    std::vector<std::string> kernel_filters;
+    if (argc > 9)
+    {
+        kernel_filters = parse_kernel_filter_csv(argv[9]);
+    }
 
     json result = {
         {"kernels", json::object()},
@@ -75,7 +81,20 @@ int main(int argc, char **argv)
         filename = filename.substr(0, filename.length() - 5);
         std::ifstream analysis_file(path);
         if (analysis_file.is_open()) {
-            result["analyses"][filename] = json::parse(analysis_file);
+            json analysis_result = json::parse(analysis_file);
+            if (!kernel_filters.empty())
+            {
+                json filtered_analysis_result = json::object();
+                for (const auto &kernel : analysis_result.items())
+                {
+                    if (kernel_matches_filter(kernel.key(), kernel_filters))
+                    {
+                        filtered_analysis_result[kernel.key()] = kernel.value();
+                    }
+                }
+                analysis_result = filtered_analysis_result;
+            }
+            result["analyses"][filename] = analysis_result;
 
             for (auto& kernel : result["analyses"][filename].items()) {
                 if (!result["kernels"].contains(kernel.key())) {
@@ -90,6 +109,10 @@ int main(int argc, char **argv)
     std::unordered_map<std::string, kernel_metrics> metric_map = create_metrics(metrics_file);
     json json_metrics = {};
     for (auto [k_metric, v_metric] : metric_map) {
+        if (!kernel_matches_filter(v_metric.kernel_name, kernel_filters))
+        {
+            continue;
+        }
         json_metrics[v_metric.kernel_name] = total_memory_flow(v_metric, sm_count);
         json_metrics[v_metric.kernel_name]["misc"] = v_metric.metrics_list;
     }
@@ -99,6 +122,10 @@ int main(int argc, char **argv)
     std::unordered_map<std::string, std::vector<pc_issue_samples>> stall_map = get_warp_stalls(pc_samples_file, sass_file, analysis_kind::ALL);
     for (auto [k_pc, v_pc] : stall_map) 
     {
+        if (!kernel_matches_filter(k_pc, kernel_filters))
+        {
+            continue;
+        }
         result["stalls"][k_pc] = json::array();
 
         for (auto sample : v_pc) 

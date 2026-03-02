@@ -10,6 +10,7 @@
 #include "parser_sass_use_shared.hpp"
 #include "parser_pcsampling.hpp"
 #include "parser_metrics.hpp"
+#include "kernel_filter.hpp"
 #include "utilities/json.hpp"
 
 using json = nlohmann::json;
@@ -55,7 +56,7 @@ void print_stalls_percentage(const pc_issue_samples &index)
 /// @param branch_map Target branch information to detect if the atomic operation is in a for-loop
 /// @param pc_stall_map CUPTI warp stalls
 /// @param metric_map Metric analysis
-json merge_analysis_use_shared(std::unordered_map<std::string, std::vector<register_access>> shared_analysis_map, std::unordered_map<std::string, std::vector<branch_counter>> branch_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map)
+json merge_analysis_use_shared(std::unordered_map<std::string, std::vector<register_access>> shared_analysis_map, std::unordered_map<std::string, std::vector<branch_counter>> branch_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map, const std::vector<std::string> &kernel_filters)
 {
     json result;
 
@@ -70,6 +71,10 @@ json merge_analysis_use_shared(std::unordered_map<std::string, std::vector<regis
         if (k_sass == "")
         {
             break;
+        }
+        if (!kernel_matches_filter(k_sass, kernel_filters))
+        {
+            continue;
         }
 
         std::cout << "--------------------- Use shared memory analysis for kernel: " << k_sass << "   --------------------- " << std::endl;
@@ -213,8 +218,13 @@ int main(int argc, char **argv)
 
     int save_as_json = std::strcmp(argv[6], "true") == 0;
     std::string json_output_dir = argv[7];
+    std::vector<std::string> kernel_filters;
+    if (argc > 8)
+    {
+        kernel_filters = parse_kernel_filter_csv(argv[8]);
+    }
 
-    json result = merge_analysis_use_shared(shared_analysis_map, branch_map, pc_stall_map, metric_map);
+    json result = merge_analysis_use_shared(shared_analysis_map, branch_map, pc_stall_map, metric_map, kernel_filters);
 
     if (save_as_json)
     {

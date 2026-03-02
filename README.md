@@ -44,9 +44,16 @@ Run the GPUscout.sh script, which was installed to the defined install directory
 ./GPUscout -e ../executable/gaussian -a '-q -s 2000'
 ```
 
+Example with explicit kernel/analysis selection:
+```bash
+./GPUscout -e ../executable/gaussian -a '-q -s 2000' \
+  --kernels loop_compact,acceleration_kernel \
+  --analysis warp_divergence,use_shared
+```
+
 The following input arguments and syntax are supported:
 ```bash
-Usage: GPUscout [-h] [--dry-run] [--verbose] -e executable [-c directory] [--args]"
+Usage: GPUscout [-h] [--dry-run] [--verbose] -e executable [-c directory] [--args] [--kernels list] [--analysis list]
     -h | --help : Display this help.
     --dry_run : performs only dry_run. A --dry_run will only analyse the SASS instructions. --dry_run will neither read warp stalls nor Nsight metrics
     -v | --verbose : print more verbose output.
@@ -55,7 +62,15 @@ Usage: GPUscout [-h] [--dry-run] [--verbose] -e executable [-c directory] [--arg
     -a | --args : Arguments for running the binary. e.g. --args=\"64 2 2 temp_64 power_64 output_64.txt\"
     --sm_count : Can be used to specify the number of streaming multiprocessors of the current GPU, as this will be used in calculations (default: 16)
     -j | --json : Save a JSON-formatted version of the output (Needed for the use of GPUscout-GUI)
+    --kernels : Comma-separated kernel patterns used for Nsight Compute metric collection and kernel filtering in merged analysis output.
+                If omitted, GPUscout automatically discovers kernels from generated SASS (cubin-scoped).
+    --analysis : Comma-separated analysis IDs to run. Valid IDs:
+                 register_spilling,use_restrict,vectorization,global_atomics,
+                 warp_divergence,use_texture,use_shared,datatype_conversion,deadlock_detection
+                 If omitted, all analyses are enabled.
 ```
+
+`--kernels` controls Nsight Compute (`ncu`) collection and also filters kernel entries in merged analysis/JSON output. If `--kernels` is omitted, GPUscout auto-discovers kernels from generated SASS (cubin-scoped) and applies that set end-to-end. `--analysis` limits which analyses run; if omitted, all analyses are run. File names and JSON structure remain unchanged.
 
 This should automatically start analysing the code and printing recommendations on the terminal screen.
 

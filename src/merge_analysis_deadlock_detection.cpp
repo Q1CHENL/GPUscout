@@ -8,6 +8,7 @@
  */
 
 #include "parser_sass_deadlock_detection.hpp"
+#include "kernel_filter.hpp"
 #include "utilities/json.hpp"
 #include <cstring>
 #include <cstring>
@@ -17,7 +18,7 @@ using json = nlohmann::json;
 
 /// @brief Detects deadlock in code
 /// @param detection_map Analysis for deadlock detection
-json merge_analysis_deadlock_detection(std::unordered_map<std::string, deadlock_detect> detection_map)
+json merge_analysis_deadlock_detection(std::unordered_map<std::string, deadlock_detect> detection_map, const std::vector<std::string> &kernel_filters)
 {
     json result;
 
@@ -32,6 +33,10 @@ json merge_analysis_deadlock_detection(std::unordered_map<std::string, deadlock_
         if (k_sass == "")
         {
             break;
+        }
+        if (!kernel_matches_filter(k_sass, kernel_filters))
+        {
+            continue;
         }
 
         std::cout << "--------------------- Deadlock detect analysis for kernel: " << k_sass << "   --------------------- " << std::endl;
@@ -50,8 +55,13 @@ int main(int argc, char **argv)
 
     int save_as_json = std::strcmp(argv[6], "true") == 0;
     std::string json_output_dir = argv[7];
+    std::vector<std::string> kernel_filters;
+    if (argc > 8)
+    {
+        kernel_filters = parse_kernel_filter_csv(argv[8]);
+    }
 
-    json result = merge_analysis_deadlock_detection(detection_map);
+    json result = merge_analysis_deadlock_detection(detection_map, kernel_filters);
 
     if (save_as_json)
     {

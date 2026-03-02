@@ -10,6 +10,7 @@
 #include "parser_ptx_global_atomics.hpp"
 #include "parser_pcsampling.hpp"
 #include "parser_metrics.hpp"
+#include "kernel_filter.hpp"
 #include "utilities/json.hpp"
 #include <cstring>
 #include <iostream>
@@ -42,7 +43,7 @@ void print_stalls_percentage(const pc_issue_samples &index)
 /// @param branch_map Target branch information to detect if the atomic operation is in a for-loop
 /// @param pc_stall_map CUPTI warp stalls
 /// @param metric_map Metric analysis
-json merge_analysis_global_shared_atomic(std::unordered_map<std::string, atomic_counter> ptx_atomic_map, std::unordered_map<std::string, std::vector<branch_counter>> branch_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map)
+json merge_analysis_global_shared_atomic(std::unordered_map<std::string, atomic_counter> ptx_atomic_map, std::unordered_map<std::string, std::vector<branch_counter>> branch_map, std::unordered_map<std::string, std::vector<pc_issue_samples>> pc_stall_map, std::unordered_map<std::string, kernel_metrics> metric_map, const std::vector<std::string> &kernel_filters)
 {
     json result;
 
@@ -56,6 +57,10 @@ json merge_analysis_global_shared_atomic(std::unordered_map<std::string, atomic_
         if (k_sass == "")
         {
             break;
+        }
+        if (!kernel_matches_filter(k_sass, kernel_filters))
+        {
+            continue;
         }
 
         std::cout << "--------------------- Global atomics analysis for kernel: " << k_sass << "   --------------------- " << std::endl;
@@ -209,8 +214,13 @@ int main(int argc, char **argv)
 
     int save_as_json = std::strcmp(argv[6], "true") == 0;
     std::string json_output_dir = argv[7];
+    std::vector<std::string> kernel_filters;
+    if (argc > 8)
+    {
+        kernel_filters = parse_kernel_filter_csv(argv[8]);
+    }
 
-    json result = merge_analysis_global_shared_atomic(ptx_atomic_map, branch_map, pc_stall_map, metric_map);
+    json result = merge_analysis_global_shared_atomic(ptx_atomic_map, branch_map, pc_stall_map, metric_map, kernel_filters);
 
     if (save_as_json)
     {

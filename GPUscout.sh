@@ -2,7 +2,7 @@
 
 # Define the usage function
 usage() {
-    echo "Usage: $0 [-h] [--dry-run] [--verbose] -e executable [-c directory] [--args]"
+    echo "Usage: $0 [-h] [--dry-run] [--verbose] -e executable [-c directory] [--args] [--kernels list] [--analysis list]"
     echo "  -h | --help : Display this help."
     echo "  --dry_run : performs only dry_run. A --dry_run will only analyse the SASS instructions. --dry_run will neither read warp stalls nor Nsight metrics "
     echo "  -v | --verbose : print more verbose output. "
@@ -11,11 +11,15 @@ usage() {
     echo "  -a | --args : Arguments for running the binary. e.g. --args=\"64 2 2 temp_64 power_64 output_64.txt\""
     echo "  --sm_count : Can be used to specify the number of streaming multiprocessors of the current GPU, as this will be used in calculations (default: 16)"
     echo "  -j | --json : Save a JSON-formatted version of the output (Needed for the use of GPUscout-GUI)"
+    echo "  --kernels : Comma-separated kernel patterns for NCU collection and end-to-end kernel filtering in final analysis output."
+    echo "              If omitted, kernels are auto-discovered from generated SASS (cubin-scoped)."
+    echo "  --analysis : Comma-separated analyses to run. e.g. --analysis=\"warp_divergence,use_shared\""
+    echo "              If omitted, all analyses are enabled."
     exit 1
 }
 
 # Parse command-line options
-options=$(getopt -o hve:c:a:j -l help,dry_run,verbose,executable:,cubin:,args:,sm_count:,json -- "$@")
+options=$(getopt -o hve:c:a:j -l help,dry_run,verbose,executable:,cubin:,args:,sm_count:,json,kernels:,analysis: -- "$@")
 
 if [ $? -ne 0 ]; then
     echo "Error: Invalid option."
@@ -31,6 +35,8 @@ executable=""
 cubin=""
 args=""
 sms=16
+kernels_arg=""
+analysis_arg=""
 while true; do
     case "$1" in
         -h | --help)
@@ -64,6 +70,14 @@ while true; do
             sms="$2"
             shift 2
             ;;
+        --kernels)
+            kernels_arg="$2"
+            shift 2
+            ;;
+        --analysis)
+            analysis_arg="$2"
+            shift 2
+            ;;
         --)
             shift
             break
@@ -74,6 +88,86 @@ while true; do
             ;;
     esac
 done
+
+trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "${value}"
+}
+
+normalize_csv_list() {
+    local raw="$1"
+    local normalized
+    normalized=$(printf '%s' "${raw}" | sed -E 's/[[:space:]]*,[[:space:]]*/,/g')
+    trim_whitespace "${normalized}"
+}
+
+validate_csv_list_syntax() {
+    local raw="$1"
+    local option_name="$2"
+    local normalized
+    normalized="$(normalize_csv_list "${raw}")"
+
+    if [ -z "${normalized}" ] || [[ "${normalized}" == ,* ]] || [[ "${normalized}" == *, ]] || [[ "${normalized}" == *",,"* ]]; then
+        echo "ERROR: Malformed --${option_name} list: \"${raw}\""
+        echo "Expected comma-separated non-empty values, e.g. a,b,c"
+        exit 1
+    fi
+}
+
+is_valid_analysis_name() {
+    local candidate="$1"
+    local allowed
+    for allowed in \
+        register_spilling \
+        use_restrict \
+        vectorization \
+        global_atomics \
+        warp_divergence \
+        use_texture \
+        use_shared \
+        datatype_conversion \
+        deadlock_detection
+    do
+        if [ "${candidate}" = "${allowed}" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+validate_analysis_values() {
+    local raw="$1"
+    local normalized token trimmed
+    local token_list=()
+    local invalid=()
+
+    normalized="$(normalize_csv_list "${raw}")"
+    IFS=',' read -r -a token_list <<< "${normalized}"
+
+    for token in "${token_list[@]}"; do
+        trimmed="$(trim_whitespace "${token}")"
+        if ! is_valid_analysis_name "${trimmed}"; then
+            invalid+=("${trimmed}")
+        fi
+    done
+
+    if [ "${#invalid[@]}" -gt 0 ]; then
+        local IFS=,
+        echo "ERROR: Invalid analysis name(s): ${invalid[*]}"
+        echo "Valid values: register_spilling,use_restrict,vectorization,global_atomics,warp_divergence,use_texture,use_shared,datatype_conversion,deadlock_detection"
+        exit 1
+    fi
+}
+
+if [ -n "${kernels_arg}" ]; then
+    validate_csv_list_syntax "${kernels_arg}" "kernels"
+fi
+if [ -n "${analysis_arg}" ]; then
+    validate_csv_list_syntax "${analysis_arg}" "analysis"
+    validate_analysis_values "${analysis_arg}"
+fi
 
 #check the params
 if [ -z "$executable" ]; then
@@ -125,6 +219,8 @@ echo "==== Arguments for the executable file: \"$args\""
 echo "==== Dry-run: $dry_run"
 echo "==== Verbose: $verbose"
 echo "==== JSON Output: $json"
+echo "==== Kernels Filter: ${kernels_arg:-<not set: auto-select kernels from generated SASS (cubin-scoped)>}"
+echo "==== Analyses: ${analysis_arg:-<not set: all analyses>}"
 echo "======================================================================================================"
 
 
@@ -205,18 +301,24 @@ echo "Setting up profiling . . . . . . . . . . . . . . . "
 
 cd ${gpuscout_dir}
 echo -e "Generating binaries . . . . . . . . . . . . . . . . . . . ."
+start_static=$(date +%s.%N)
 nvdisasm -g -c ${cubin} > ${gpuscout_tmp_dir}/nvdisasm-hpctoolkit-${run_prefix}-sass.txt #TODO this line necessary?
 nvdisasm -g -c ${cubin} > ${gpuscout_tmp_dir}/nvdisasm-executable-${run_prefix}-sass.txt
 cuobjdump -ptx ${executable} > ${gpuscout_tmp_dir}/nvdisasm-executable-${run_prefix}-ptx.txt
 nvdisasm -g -c -lrm=count ${cubin} > ${gpuscout_tmp_dir}/nvdisasm-registers-hpctoolkit-${run_prefix}-sass.txt #TODO this line necessary?
 nvdisasm -g -c -lrm=count ${cubin} > ${gpuscout_tmp_dir}/nvdisasm-registers-executable-${run_prefix}-sass.txt
+end_static=$(date +%s.%N)
+static_time=$(awk "BEGIN {print $end_static - $start_static}")
 
 
 # Run the generate_sampling_stalls script inside the sampling_utilities directory
 if [ "$dry_run" = false ]; then
     echo "Getting warp stall reasons . . . . . . . . . . . . . . . "
+    start_pcsampling=$(date +%s.%N)
     source ${gpuscout_dir}/sampling_utilities/generate_sampling_stalls.sh
     cp ${gpuscout_dir}/sampling_utilities/sampling_utility/pcsampling_${run_prefix}.txt ${gpuscout_tmp_dir}/pcsampling_${run_prefix}.txt
+    end_pcsampling=$(date +%s.%N)
+    pcsampling_time=$(awk "BEGIN {print $end_pcsampling - $start_pcsampling}")
 fi
 
 # Get the measurements and analysis from the measurements script
